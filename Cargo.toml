@@ -1,0 +1,22 @@
+[package]
+name = "tc-ir"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+pyo3-conversions = ["dep:pyo3"]
+
+[dependencies]
+async-trait = "0.1"
+destream = "0.8"
+serde = { version = "1", features = ["derive"] }
+umask = "2.1"
+pathlink = { version = "0.3", features = ["stream"] }
+tc-error = "0.12"
+tc-value = { path = "../tc-value" }
+pyo3 = { version = "0.21", optional = true }
+
+[dev-dependencies]
+destream_json = { version = "0.13", default-features = false }
+futures = "0.3"
