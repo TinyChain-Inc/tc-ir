@@ -15,6 +15,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tc_error::{TCError, TCResult};
 use tc_value::Value;
 
+pub use tc_value::class::{Class, NativeClass};
+
 #[cfg(feature = "pyo3-conversions")]
 use pyo3::prelude::*;
 
@@ -482,6 +484,12 @@ impl<'en> en::ToStream<'en> for LibrarySchema {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scalar {
     Value(Value),
+}
+
+impl Default for Scalar {
+    fn default() -> Self {
+        Scalar::Value(Value::default())
+    }
 }
 
 impl From<Value> for Scalar {
