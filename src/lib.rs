@@ -125,7 +125,7 @@ pub trait Transaction: Send + Sync {
 }
 
 /// Serializable header that conveys transaction context across process or WASM boundaries.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxnHeader {
     id: TxnId,
     timestamp: NetworkTime,
@@ -155,6 +155,84 @@ impl TxnHeader {
 
     pub fn claim(&self) -> &Claim {
         &self.claim
+    }
+}
+
+impl Serialize for TxnHeader {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("id", &self.id.to_string())?;
+        map.serialize_entry("timestamp", &self.timestamp.as_nanos())?;
+        let claim = (self.claim.link.to_string(), u32::from(self.claim.mask));
+        map.serialize_entry("claim", &claim)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TxnHeader {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::MapAccess;
+
+        struct HeaderVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HeaderVisitor {
+            type Value = TxnHeader;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a transaction header map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut id: Option<TxnId> = None;
+                let mut timestamp: Option<NetworkTime> = None;
+                let mut claim: Option<Claim> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => {
+                            let value = map.next_value::<String>()?;
+                            let parsed = TxnId::from_str(&value)
+                                .map_err(|err| serde::de::Error::custom(err.to_string()))?;
+                            id = Some(parsed);
+                        }
+                        "timestamp" => {
+                            let nanos = map.next_value::<u64>()?;
+                            timestamp = Some(NetworkTime::from_nanos(nanos));
+                        }
+                        "claim" => {
+                            let (link, mask): (String, u32) = map.next_value()?;
+                            let link = Link::from_str(&link)
+                                .map_err(|err| serde::de::Error::custom(err.to_string()))?;
+                            let mask: umask::Mode = mask.into();
+                            claim = Some(Claim::new(link, mask));
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                let id = id.ok_or_else(|| serde::de::Error::custom("missing id"))?;
+                let timestamp =
+                    timestamp.ok_or_else(|| serde::de::Error::custom("missing timestamp"))?;
+                let claim = claim.ok_or_else(|| serde::de::Error::custom("missing claim"))?;
+
+                Ok(TxnHeader::new(id, timestamp, claim))
+            }
+        }
+
+        deserializer.deserialize_map(HeaderVisitor)
     }
 }
 
