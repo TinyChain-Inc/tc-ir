@@ -856,11 +856,11 @@ mod tests {
     #[test]
     fn library_schema_destream_roundtrip() {
         let schema = LibrarySchema::new(
-            Link::from_str("/library/service").expect("link"),
+            Link::from_str("/lib/service").expect("link"),
             "0.1.0",
             vec![
-                Link::from_str("/library/dependency").expect("dep"),
-                Link::from_str("/library/other").expect("dep"),
+                Link::from_str("/lib/dependency").expect("dep"),
+                Link::from_str("/lib/other").expect("dep"),
             ],
         );
 
@@ -875,7 +875,7 @@ mod tests {
     #[test]
     fn txn_header_destream_roundtrip() {
         let claim = Claim::new(
-            Link::from_str("/library/service").unwrap(),
+            Link::from_str("/lib/service").unwrap(),
             umask::Mode::all(),
         );
         let header = TxnHeader::new(
@@ -901,7 +901,7 @@ mod tests {
         let path = vec![segment("library"), segment("status")];
         let dir = Dir::from_routes(vec![(path.clone(), HelloHandler)]).expect("dir");
 
-        let claim = Claim::new(Link::from_str("/library").unwrap(), umask::Mode::all());
+        let claim = Claim::new(Link::from_str("/lib").unwrap(), umask::Mode::all());
         let txn = FakeTxn::new(claim);
 
         let handler = dir.route(&path).expect("handler resolved");
@@ -926,13 +926,13 @@ mod tests {
     #[test]
     fn macro_builds_routes() {
         let dir = tc_library_routes! {
-            "/library/status" => HelloHandler,
+            "/lib/status" => HelloHandler,
         }
         .expect("macro routes");
 
-        let claim = Claim::new(Link::from_str("/library").unwrap(), umask::Mode::all());
+        let claim = Claim::new(Link::from_str("/lib").unwrap(), umask::Mode::all());
         let txn = FakeTxn::new(claim);
-        let path = [segment("library"), segment("status")];
+        let path = [segment("lib"), segment("status")];
         let handler = dir.route(&path).expect("handler");
         let fut = handler.get(&txn, "macro".into()).expect("GET");
         let out = futures::executor::block_on(fut).unwrap();
@@ -942,15 +942,15 @@ mod tests {
     #[test]
     fn static_library_wraps_schema_and_routes() {
         let schema =
-            LibrarySchema::new(Link::from_str("/library/service").unwrap(), "1.0.0", vec![]);
+            LibrarySchema::new(Link::from_str("/lib/service").unwrap(), "1.0.0", vec![]);
         let routes = tc_library_routes! {
-            "/library/status" => HelloHandler,
+            "/lib/status" => HelloHandler,
         }
         .expect("routes");
 
         let lib: StaticLibrary<FakeTxn, _> = StaticLibrary::new(schema.clone(), routes);
         assert_eq!(lib.schema(), &schema);
-        let path = [segment("library"), segment("status")];
+        let path = [segment("lib"), segment("status")];
         assert!(lib.routes().route(&path).is_some());
     }
 }

@@ -63,7 +63,7 @@ fn main() -> TCResult<()> {
 pub fn run_example() -> TCResult<()> {
     // This schema would typically match the manifest you publish via `/lib`.
     let schema = LibrarySchema::new(
-        Link::from_str("/library/examples/hello").expect("example link"),
+        Link::from_str("/lib/examples/hello").expect("example link"),
         "0.1.0",
         vec![],
     );
@@ -81,7 +81,7 @@ pub fn run_example() -> TCResult<()> {
         .expect("handler registered at /hello");
 
     let txn = ExampleTxn::new(Claim::new(
-        Link::from_str("/library/examples/hello").expect("claim link"),
+        Link::from_str("/lib/examples/hello").expect("claim link"),
         Mode::all(),
     ));
 
