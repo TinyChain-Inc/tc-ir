@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, fmt, future::Future, marker::PhantomData, str::
 use async_trait::async_trait;
 use destream::{de, en, EncodeMap, IntoStream};
 
-use pathlink::{Link, Path, PathSegment};
+use pathlink::{Link, Path, PathBuf, PathSegment};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tc_error::{TCError, TCResult};
 use tc_value::Value;
@@ -562,6 +562,69 @@ impl<'en> en::ToStream<'en> for LibrarySchema {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scalar {
     Value(Value),
+    Ref(Box<TCRef>),
+}
+
+/// A deterministic map type used by the TinyChain IR.
+///
+/// This is a v2 placeholder for the richer map/tuple scalar types from v1.
+pub type Map<T> = BTreeMap<String, T>;
+
+/// A reference to a named value in a scope (e.g. "$self").
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct IdRef(String);
+
+impl IdRef {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The subject of an op.
+///
+/// Copied from the v1 `OpRef` model: an op may target either a concrete [`Link`] or a scoped
+/// reference plus a suffix path.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Subject {
+    Link(Link),
+    Ref(IdRef, PathBuf),
+}
+
+/// The data defining a reference to a GET op.
+pub type GetRef = (Subject, Scalar);
+
+/// The data defining a reference to a PUT op.
+pub type PutRef = (Subject, Scalar, Scalar);
+
+/// The data defining a reference to a POST op.
+pub type PostRef = (Subject, Map<Scalar>);
+
+/// The data defining a reference to a DELETE op.
+pub type DeleteRef = (Subject, Scalar);
+
+/// A reference to an op.
+///
+/// This is a structural port of the v1 `OpRef` enum. Resolution/execution is implemented by the
+/// host kernel and is intentionally not part of this type definition.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OpRef {
+    Get(GetRef),
+    Put(PutRef),
+    Post(PostRef),
+    Delete(DeleteRef),
+}
+
+/// A reference to a scalar value.
+///
+/// v2 currently supports only op references (`TCRef::Op`). Control-flow references (`If`, `While`,
+/// `Case`, etc.) will be added once the kernel has a complete ref scheduler.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TCRef {
+    Op(OpRef),
 }
 
 impl Default for Scalar {
@@ -573,6 +636,12 @@ impl Default for Scalar {
 impl From<Value> for Scalar {
     fn from(value: Value) -> Self {
         Scalar::Value(value)
+    }
+}
+
+impl From<TCRef> for Scalar {
+    fn from(value: TCRef) -> Self {
+        Scalar::Ref(Box::new(value))
     }
 }
 
@@ -874,10 +943,7 @@ mod tests {
 
     #[test]
     fn txn_header_destream_roundtrip() {
-        let claim = Claim::new(
-            Link::from_str("/lib/service").unwrap(),
-            umask::Mode::all(),
-        );
+        let claim = Claim::new(Link::from_str("/lib/service").unwrap(), umask::Mode::all());
         let header = TxnHeader::new(
             TxnId::from_parts(NetworkTime::from_nanos(7), 1),
             NetworkTime::from_nanos(7),
@@ -941,8 +1007,7 @@ mod tests {
 
     #[test]
     fn static_library_wraps_schema_and_routes() {
-        let schema =
-            LibrarySchema::new(Link::from_str("/lib/service").unwrap(), "1.0.0", vec![]);
+        let schema = LibrarySchema::new(Link::from_str("/lib/service").unwrap(), "1.0.0", vec![]);
         let routes = tc_library_routes! {
             "/lib/status" => HelloHandler,
         }
