@@ -7,7 +7,6 @@
 
 use std::{collections::BTreeMap, fmt, future::Future, marker::PhantomData, str::FromStr};
 
-use async_trait::async_trait;
 use destream::{de, en, EncodeMap, IntoStream};
 
 use pathlink::{Link, Path, PathBuf, PathSegment};
@@ -236,7 +235,6 @@ impl<'de> Deserialize<'de> for TxnHeader {
     }
 }
 
-#[async_trait]
 impl de::FromStream for TxnHeader {
     type Context = ();
 
@@ -246,7 +244,6 @@ impl de::FromStream for TxnHeader {
     ) -> Result<Self, D::Error> {
         struct HeaderVisitor;
 
-        #[async_trait]
         impl de::Visitor for HeaderVisitor {
             type Value = TxnHeader;
 
@@ -473,7 +470,6 @@ impl LibrarySchema {
     }
 }
 
-#[async_trait]
 impl de::FromStream for LibrarySchema {
     type Context = ();
 
@@ -483,7 +479,6 @@ impl de::FromStream for LibrarySchema {
     ) -> Result<Self, D::Error> {
         struct SchemaVisitor;
 
-        #[async_trait]
         impl de::Visitor for SchemaVisitor {
             type Value = LibrarySchema;
 
