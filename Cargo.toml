@@ -15,6 +15,7 @@ umask = "2.1"
 pathlink = { version = "0.4", features = ["stream"] }
 tc-error = "0.13"
 tc-value = { path = "../tc-value" }
+number-general = { version = "0.14", default-features = false, features = ["stream"] }
 pyo3 = { version = "0.21", optional = true }
 
 [dev-dependencies]

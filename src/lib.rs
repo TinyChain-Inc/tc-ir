@@ -9,10 +9,11 @@ use std::{collections::BTreeMap, fmt, future::Future, marker::PhantomData, str::
 
 use destream::{de, en, EncodeMap, IntoStream};
 
-use pathlink::{Link, Path, PathBuf, PathSegment};
+use pathlink::{Link, Path, PathBuf, PathLabel, PathSegment, path_label};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tc_error::{TCError, TCResult};
-use tc_value::Value;
+use number_general::Number;
+use tc_value::{Value, ValueType};
 
 pub use tc_value::class::{Class, NativeClass};
 
@@ -554,6 +555,15 @@ impl<'en> en::ToStream<'en> for LibrarySchema {
 }
 
 /// Scalar values exchanged via the TinyChain IR.
+///
+/// ## v1-compatible JSON semantics
+///
+/// This crate intentionally uses the v1 TinyChain reference encoding conventions when serialized
+/// via `destream_json`:
+///
+/// - A scalar value is encoded like a v1 scalar value (e.g. `null`, or a typed map like
+///   `{"\/state\/scalar\/value\/number": 3}`).
+/// - A reference is encoded as an op ref / TC ref map (see [`OpRef`] and [`TCRef`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scalar {
     Value(Value),
@@ -583,6 +593,13 @@ impl IdRef {
 ///
 /// Copied from the v1 `OpRef` model: an op may target either a concrete [`Link`] or a scoped
 /// reference plus a suffix path.
+///
+/// ## v1-compatible JSON semantics
+///
+/// Encoded as a string:
+///
+/// - A concrete [`Link`] encodes as its string form (e.g. `"/lib/acme/foo/1.0.0"`).
+/// - A scoped ref encodes as `"$id"` or `"$id/suffix/path"`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Subject {
     Link(Link),
@@ -605,6 +622,15 @@ pub type DeleteRef = (Subject, Scalar);
 ///
 /// This is a structural port of the v1 `OpRef` enum. Resolution/execution is implemented by the
 /// host kernel and is intentionally not part of this type definition.
+///
+/// ## v1-compatible JSON semantics
+///
+/// Encoded as a single-entry map:
+///
+/// - GET: `{ "<subject>": [<key>] }`
+/// - PUT: `{ "<subject>": [<key>, <value>] }`
+/// - POST: `{ "<subject>": { "<name>": <value>, ... } }`
+/// - DELETE: `{ "/state/scalar/ref/op/delete": [<subject>, <key>] }`
 #[derive(Clone, Debug, PartialEq)]
 pub enum OpRef {
     Get(GetRef),
@@ -617,9 +643,459 @@ pub enum OpRef {
 ///
 /// v2 currently supports only op references (`TCRef::Op`). Control-flow references (`If`, `While`,
 /// `Case`, etc.) will be added once the kernel has a complete ref scheduler.
+///
+/// ## v1-compatible JSON semantics
+///
+/// Encoded as the underlying [`OpRef`] map (no wrapper).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TCRef {
     Op(OpRef),
+}
+
+pub const OPREF_GET: PathLabel = path_label(&["state", "scalar", "ref", "op", "get"]);
+pub const OPREF_PUT: PathLabel = path_label(&["state", "scalar", "ref", "op", "put"]);
+pub const OPREF_POST: PathLabel = path_label(&["state", "scalar", "ref", "op", "post"]);
+pub const OPREF_DELETE: PathLabel = path_label(&["state", "scalar", "ref", "op", "delete"]);
+
+impl de::FromStream for IdRef {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(
+        _context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        let id = String::from_stream((), decoder).await?;
+        Ok(Self::new(id))
+    }
+}
+
+impl<'en> en::IntoStream<'en> for IdRef {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        self.0.into_stream(encoder)
+    }
+}
+
+impl<'en> en::ToStream<'en> for IdRef {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        self.0.to_stream(encoder)
+    }
+}
+
+impl fmt::Display for IdRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for Subject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Subject::Link(link) => fmt::Display::fmt(link, f),
+            Subject::Ref(id, path) if path.is_empty() => fmt::Display::fmt(id, f),
+            Subject::Ref(id, path) => write!(f, "{id}{path}"),
+        }
+    }
+}
+
+impl de::FromStream for Subject {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(
+        _context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        let s = String::from_stream((), decoder).await?;
+
+        subject_from_str(&s).map_err(|err| de::Error::custom(err.to_string()))
+    }
+}
+
+impl<'en> en::IntoStream<'en> for Subject {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        self.to_string().into_stream(encoder)
+    }
+}
+
+impl<'en> en::ToStream<'en> for Subject {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        en::IntoStream::into_stream(self.to_string(), encoder)
+    }
+}
+
+impl de::FromStream for Scalar {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(
+        _context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        struct ScalarVisitor;
+
+        impl de::Visitor for ScalarVisitor {
+            type Value = Scalar;
+
+            fn expecting() -> &'static str {
+                "a Scalar value or ref"
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(Scalar::Value(Value::None))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(Scalar::Value(Value::None))
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(Scalar::Value(Value::Number(Number::from(value))))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(Scalar::Value(Value::Number(Number::from(value))))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(Scalar::Value(Value::Number(Number::from(value))))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(Scalar::Value(Value::Number(Number::from(value))))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(Scalar::Value(Value::String(value)))
+            }
+
+            async fn visit_map<A: de::MapAccess>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let key = map
+                    .next_key::<String>(())
+                    .await?
+                    .ok_or_else(|| de::Error::custom("expected map key"))?;
+
+                if key.starts_with('/') {
+                    if let Ok(path) = PathBuf::from_str(&key) {
+                        if let Some(value_type) = ValueType::from_path(&path) {
+                            let value = match value_type {
+                                ValueType::None => {
+                                    let _ = map.next_value::<de::IgnoredAny>(()).await?;
+                                    Value::None
+                                }
+                                ValueType::Number => {
+                                    let number = map.next_value::<Number>(()).await?;
+                                    Value::Number(number)
+                                }
+                                ValueType::String => {
+                                    let s = map.next_value::<String>(()).await?;
+                                    Value::String(s)
+                                }
+                            };
+
+                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
+                            }
+
+                            return Ok(Scalar::Value(value));
+                        }
+                    }
+                }
+
+                // Otherwise interpret this as a v1-style OpRef map and return a `Scalar::Ref`.
+                // Since this scalar type doesn't support general map/tuple values yet, this is the
+                // only supported non-`Value` map shape.
+                let op = decode_opref_map_entry(key, &mut map).await?;
+                Ok(Scalar::Ref(Box::new(TCRef::Op(op))))
+            }
+        }
+
+        decoder.decode_any(ScalarVisitor).await
+    }
+}
+
+impl<'en> en::IntoStream<'en> for Scalar {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        match self {
+            Scalar::Value(value) => value.into_stream(encoder),
+            Scalar::Ref(r) => (*r).into_stream(encoder),
+        }
+    }
+}
+
+impl<'en> en::ToStream<'en> for Scalar {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        self.clone().into_stream(encoder)
+    }
+}
+
+impl de::FromStream for OpRef {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(
+        _context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        struct OpRefVisitor;
+
+        impl de::Visitor for OpRefVisitor {
+            type Value = OpRef;
+
+            fn expecting() -> &'static str {
+                "an OpRef map"
+            }
+
+            async fn visit_map<A: de::MapAccess>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let key = map
+                    .next_key::<String>(())
+                    .await?
+                    .ok_or_else(|| de::Error::custom("expected OpRef, found empty map"))?;
+
+                decode_opref_map_entry(key, &mut map).await
+            }
+        }
+
+        decoder.decode_map(OpRefVisitor).await
+    }
+}
+
+impl<'en> en::IntoStream<'en> for OpRef {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        match self {
+            OpRef::Get((subject, key)) => {
+                let mut map = encoder.encode_map(Some(1))?;
+                map.encode_key(subject.to_string())?;
+                map.encode_value(ScalarSeq::new(vec![key]))?;
+                map.end()
+            }
+            OpRef::Put((subject, key, value)) => {
+                let mut map = encoder.encode_map(Some(1))?;
+                map.encode_key(subject.to_string())?;
+                map.encode_value(ScalarSeq::new(vec![key, value]))?;
+                map.end()
+            }
+            OpRef::Post((subject, params)) => {
+                let mut map = encoder.encode_map(Some(1))?;
+                map.encode_entry(subject.to_string(), params)?;
+                map.end()
+            }
+            OpRef::Delete((subject, key)) => {
+                let mut map = encoder.encode_map(Some(1))?;
+                map.encode_key(PathBuf::from(OPREF_DELETE).to_string())?;
+                map.encode_value(SubjectScalarSeq::new(subject, key))?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'en> en::ToStream<'en> for OpRef {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        self.clone().into_stream(encoder)
+    }
+}
+
+impl de::FromStream for TCRef {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(
+        _context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        OpRef::from_stream((), decoder).await.map(TCRef::Op)
+    }
+}
+
+impl<'en> en::IntoStream<'en> for TCRef {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        match self {
+            TCRef::Op(op) => op.into_stream(encoder),
+        }
+    }
+}
+
+impl<'en> en::ToStream<'en> for TCRef {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        self.clone().into_stream(encoder)
+    }
+}
+
+struct ScalarSeq(Vec<Scalar>);
+
+impl ScalarSeq {
+    fn new(items: Vec<Scalar>) -> Self {
+        Self(items)
+    }
+}
+
+impl<'en> en::IntoStream<'en> for ScalarSeq {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        use destream::en::EncodeSeq;
+
+        let mut seq = encoder.encode_seq(Some(self.0.len()))?;
+        for item in self.0 {
+            seq.encode_element(item)?;
+        }
+        seq.end()
+    }
+}
+
+struct SubjectScalarSeq {
+    subject: Subject,
+    key: Scalar,
+}
+
+impl SubjectScalarSeq {
+    fn new(subject: Subject, key: Scalar) -> Self {
+        Self { subject, key }
+    }
+}
+
+impl<'en> en::IntoStream<'en> for SubjectScalarSeq {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        use destream::en::EncodeSeq;
+
+        let mut seq = encoder.encode_seq(Some(2))?;
+        seq.encode_element(self.subject)?;
+        seq.encode_element(self.key)?;
+        seq.end()
+    }
+}
+
+enum OpArgs {
+    Seq(Vec<Scalar>),
+    Map(Map<Scalar>),
+}
+
+impl de::FromStream for OpArgs {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(
+        _context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        struct ArgsVisitor;
+
+        impl de::Visitor for ArgsVisitor {
+            type Value = OpArgs;
+
+            fn expecting() -> &'static str {
+                "OpRef args (a sequence or map)"
+            }
+
+            async fn visit_map<A: de::MapAccess>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut params = Map::<Scalar>::new();
+                while let Some(key) = map.next_key::<String>(()).await? {
+                    let value = map.next_value::<Scalar>(()).await?;
+                    params.insert(key, value);
+                }
+                Ok(OpArgs::Map(params))
+            }
+
+            async fn visit_seq<A: de::SeqAccess>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items = if let Some(len) = access.size_hint() {
+                    Vec::with_capacity(len)
+                } else {
+                    Vec::new()
+                };
+
+                while let Some(item) = access.next_element::<Scalar>(()).await? {
+                    items.push(item);
+                }
+
+                Ok(OpArgs::Seq(items))
+            }
+        }
+
+        decoder.decode_any(ArgsVisitor).await
+    }
+}
+
+fn subject_from_str(s: &str) -> Result<Subject, TCError> {
+    if s.starts_with('$') {
+        if let Some(i) = s.find('/') {
+            let id = &s[..i];
+            let path_str = &s[i..];
+            let path = PathBuf::from_str(path_str)
+                .map_err(|err| TCError::bad_request(err.to_string()))?;
+            Ok(Subject::Ref(IdRef::new(id.to_string()), path))
+        } else {
+            Ok(Subject::Ref(IdRef::new(s.to_string()), PathBuf::default()))
+        }
+    } else {
+        Link::from_str(s).map(Subject::Link).map_err(TCError::from)
+    }
+}
+
+async fn decode_opref_map_entry<A: de::MapAccess>(
+    key: String,
+    map: &mut A,
+) -> Result<OpRef, A::Error> {
+    let op = if key.starts_with('/') {
+        let path = PathBuf::from_str(&key).ok();
+
+        if path.as_ref() == Some(&PathBuf::from(OPREF_GET)) {
+            let get = map.next_value::<(Subject, Scalar)>(()).await?;
+            OpRef::Get(get)
+        } else if path.as_ref() == Some(&PathBuf::from(OPREF_PUT)) {
+            let put = map.next_value::<(Subject, Scalar, Scalar)>(()).await?;
+            OpRef::Put(put)
+        } else if path.as_ref() == Some(&PathBuf::from(OPREF_POST)) {
+            let post = map.next_value::<(Subject, Map<Scalar>)>(()).await?;
+            OpRef::Post(post)
+        } else if path.as_ref() == Some(&PathBuf::from(OPREF_DELETE)) {
+            let delete = map.next_value::<(Subject, Scalar)>(()).await?;
+            OpRef::Delete(delete)
+        } else {
+            let subject =
+                subject_from_str(&key).map_err(|err| de::Error::custom(err.to_string()))?;
+
+            let args = map.next_value::<OpArgs>(()).await?;
+            match args {
+                OpArgs::Map(params) => OpRef::Post((subject, params)),
+                OpArgs::Seq(items) => match items.as_slice() {
+                    [key] => OpRef::Get((subject, key.clone())),
+                    [key, value] => OpRef::Put((subject, key.clone(), value.clone())),
+                    _ => {
+                        return Err(de::Error::custom(
+                            "invalid OpRef params (expected 1 or 2 elements)",
+                        ));
+                    }
+                },
+            }
+        }
+    } else {
+        let subject = subject_from_str(&key).map_err(|err| de::Error::custom(err.to_string()))?;
+
+        let args = map.next_value::<OpArgs>(()).await?;
+        match args {
+            OpArgs::Map(params) => OpRef::Post((subject, params)),
+            OpArgs::Seq(items) => match items.as_slice() {
+                [key] => OpRef::Get((subject, key.clone())),
+                [key, value] => OpRef::Put((subject, key.clone(), value.clone())),
+                _ => {
+                    return Err(de::Error::custom(
+                        "invalid OpRef params (expected 1 or 2 elements)",
+                    ));
+                }
+            },
+        }
+    };
+
+    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+        let _ = map.next_value::<de::IgnoredAny>(()).await?;
+    }
+
+    Ok(op)
 }
 
 impl Default for Scalar {
