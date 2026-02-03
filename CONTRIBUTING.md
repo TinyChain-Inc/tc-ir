@@ -16,11 +16,11 @@ without mirroring host internals.
 
 ## Contribution workflow
 
-1. Align proposed changes with the repo-wide design guidance in `/AGENTS.md`
-   (graph-first modeling, shared primitives, no bespoke transports).
-2. Follow the shared style rules in `/CODE_STYLE.md` (grouped imports, `cargo fmt`,
-   and `cargo clippy --all-targets --all-features -D warnings`). Crate-specific notes
-   should reference that doc rather than redefining formatting.
+1. Align proposed changes with `AGENTS.md` in this repository (graph-first
+   modeling, shared primitives, no bespoke transports).
+2. Keep formatting and linting clean: run `cargo fmt` and
+   `cargo clippy --all-targets --all-features -D warnings` before sending
+   patches.
 3. Add or update documentation in `IR_INTERFACE_GUIDELINES.md` whenever you
    introduce, rename, or deprecate IR structures or macros.
 4. Run `cargo test -p tc-ir` to validate serialization/round-trip behavior, plus
@@ -31,8 +31,8 @@ without mirroring host internals.
 ## Rights and licensing
 
 By contributing to this crate you represent that (a) the work is authored by
-you (or you have the necessary rights to contribute it) and (b) you transfer and
-assign all right, title, and interest in the contribution to the TinyChain
-Open-Source Project for distribution under the TinyChain open-source license
-(Apache 2.0, see the root `LICENSE`). No other restrictions or encumbrances may
-attach to your contribution.
+you (or you have the necessary rights to contribute it), (b) the contribution is
+unencumbered by third-party intellectual property claims, and (c) you transfer
+and assign all right, title, and interest in the contribution to The TinyChain
+Contributors for distribution under the Apache 2.0 license (see `LICENSE`). No
+other restrictions or encumbrances may attach to your contribution.
