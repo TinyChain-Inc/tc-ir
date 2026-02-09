@@ -34,6 +34,14 @@ Bindings should hide these details from user code but must honor them under the 
 - Handlers may not rely on local wall-clock time; they should use transaction-provided timestamps.
 - Inputs and outputs must be serializable with a `destream`.
 
+## Op-graph payloads
+
+TinyChain v2 supports a transport-neutral op-graph payload intended to make workloads **inspectable**
+as data (deterministic DAG + fixed-count `Repeat`), so libraries/services can perform static analysis
+(metrics, conservative bounds, safety checks) without baking policy (billing, pricing, risk) into the IR.
+
+The proposed payload and its design constraints live in `tc-ir/OP_GRAPH_IR.md`.
+
 ## Error & backpressure expectations
 
 - Handlers report standardized error categories (authorization, validation, transient, etc.) so callers can take consistent action.
