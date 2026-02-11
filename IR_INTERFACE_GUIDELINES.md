@@ -42,6 +42,14 @@ as data (deterministic DAG + fixed-count `Repeat`), so libraries/services can pe
 
 The proposed payload and its design constraints live in `tc-ir/OP_GRAPH_IR.md`.
 
+## Scalar reference control flow
+
+- `TCRef::While` is encoded as `/state/scalar/ref/while` with a three-element tuple
+  `[cond, closure, state]`, mirroring v1 semantics.
+- `TCRef::If` is encoded as `/state/scalar/ref/if` with `[cond, then, or_else]`, where
+  `cond` is a scalar ref and the branches are arbitrary scalars.
+- The loop condition and closure are OpDefs, executed with a loop-carried `state` input.
+
 ## Error & backpressure expectations
 
 - Handlers report standardized error categories (authorization, validation, transient, etc.) so callers can take consistent action.

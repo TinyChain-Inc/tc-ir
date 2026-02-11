@@ -5,1342 +5,43 @@
 //! be expressive enough to back WASM sandboxes, PyO3 bindings, or the existing Rust
 //! server stack without leaking lower-level implementation details.
 
-use std::{collections::BTreeMap, fmt, future::Future, marker::PhantomData, str::FromStr};
-
-use destream::{de, en, EncodeMap, IntoStream};
-
-use pathlink::{Link, Path, PathBuf, PathLabel, PathSegment, path_label};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tc_error::{TCError, TCResult};
-use number_general::Number;
-use tc_value::{Value, ValueType};
-
+pub use hr_id::Id;
 pub use tc_value::class::{Class, NativeClass};
 
-#[cfg(feature = "pyo3-conversions")]
-use pyo3::prelude::*;
+mod txn;
+pub use txn::*;
 
-/// Network time as nanoseconds since Unix epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-pub struct NetworkTime(u64);
+mod handler;
+pub use handler::*;
 
-impl NetworkTime {
-    pub const fn from_nanos(nanos: u64) -> Self {
-        Self(nanos)
-    }
+mod map;
+pub use map::Map;
 
-    pub const fn as_nanos(&self) -> u64 {
-        self.0
-    }
-}
+mod scalar;
+pub use scalar::*;
 
-impl fmt::Display for NetworkTime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+mod op;
+pub use op::*;
 
-impl FromStr for NetworkTime {
-    type Err = &'static str;
+mod tcref;
+pub use tcref::*;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let nanos = s.parse().map_err(|_| "invalid NetworkTime")?;
-        Ok(Self::from_nanos(nanos))
-    }
-}
+mod dir;
+pub use dir::*;
 
-/// The unique ID of a transaction, copied from `tc-transact` (with serde support).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-pub struct TxnId {
-    timestamp: NetworkTime,
-    nonce: u16,
-    trace: [u8; 32],
-}
-
-impl TxnId {
-    /// Construct a new TxnId from raw parts (timestamp in nanos + nonce).
-    pub const fn from_parts(timestamp: NetworkTime, nonce: u16) -> Self {
-        Self {
-            timestamp,
-            nonce,
-            trace: [0u8; 32],
-        }
-    }
-
-    /// Attach a tracing hash (host + txn) to this ID.
-    pub fn with_trace(mut self, trace: [u8; 32]) -> Self {
-        self.trace = trace;
-        self
-    }
-
-    /// Timestamp component.
-    pub const fn timestamp(&self) -> NetworkTime {
-        self.timestamp
-    }
-
-    /// Nonce component used to break ties for identical timestamps.
-    pub const fn nonce(&self) -> u16 {
-        self.nonce
-    }
-
-    /// Tracing hash (opaque bytes).
-    pub const fn trace_bytes(&self) -> &[u8; 32] {
-        &self.trace
-    }
-}
-
-impl fmt::Display for TxnId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", self.timestamp, self.nonce)
-    }
-}
-
-impl FromStr for TxnId {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (ts, nonce) = s
-            .split_once('-')
-            .ok_or("transaction IDs must look like `<timestamp>-<nonce>`")?;
-
-        let timestamp = NetworkTime::from_nanos(ts.parse().map_err(|_| "invalid TxnId timestamp")?);
-        let nonce = nonce
-            .parse()
-            .map_err(|_| "invalid TxnId nonce (expected u16)")?;
-
-        Ok(Self::from_parts(timestamp, nonce))
-    }
-}
-
-/// Basic transaction context every handler receives.
-pub trait Transaction: Send + Sync {
-    /// Unique identifier chosen by the control plane.
-    fn id(&self) -> TxnId;
-
-    /// Consensus timestamp (deterministic per transaction).
-    fn timestamp(&self) -> NetworkTime;
-
-    /// Authorization claim scoped to this transaction.
-    fn claim(&self) -> &Claim;
-}
-
-/// Serializable header that conveys transaction context across process or WASM boundaries.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TxnHeader {
-    id: TxnId,
-    timestamp: NetworkTime,
-    claim: Claim,
-}
-
-impl TxnHeader {
-    pub fn new(id: TxnId, timestamp: NetworkTime, claim: Claim) -> Self {
-        Self {
-            id,
-            timestamp,
-            claim,
-        }
-    }
-
-    pub fn from_transaction<T: Transaction + ?Sized>(txn: &T) -> Self {
-        Self::new(txn.id(), txn.timestamp(), txn.claim().clone())
-    }
-
-    pub fn id(&self) -> TxnId {
-        self.id
-    }
-
-    pub fn timestamp(&self) -> NetworkTime {
-        self.timestamp
-    }
-
-    pub fn claim(&self) -> &Claim {
-        &self.claim
-    }
-}
-
-impl Serialize for TxnHeader {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use serde::ser::SerializeMap;
-
-        let mut map = serializer.serialize_map(Some(3))?;
-        map.serialize_entry("id", &self.id.to_string())?;
-        map.serialize_entry("timestamp", &self.timestamp.as_nanos())?;
-        let claim = (self.claim.link.to_string(), u32::from(self.claim.mask));
-        map.serialize_entry("claim", &claim)?;
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for TxnHeader {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        use serde::de::MapAccess;
-
-        struct HeaderVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for HeaderVisitor {
-            type Value = TxnHeader;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a transaction header map")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut id: Option<TxnId> = None;
-                let mut timestamp: Option<NetworkTime> = None;
-                let mut claim: Option<Claim> = None;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "id" => {
-                            let value = map.next_value::<String>()?;
-                            let parsed = TxnId::from_str(&value)
-                                .map_err(|err| serde::de::Error::custom(err.to_string()))?;
-                            id = Some(parsed);
-                        }
-                        "timestamp" => {
-                            let nanos = map.next_value::<u64>()?;
-                            timestamp = Some(NetworkTime::from_nanos(nanos));
-                        }
-                        "claim" => {
-                            let (link, mask): (String, u32) = map.next_value()?;
-                            let link = Link::from_str(&link)
-                                .map_err(|err| serde::de::Error::custom(err.to_string()))?;
-                            let mask: umask::Mode = mask.into();
-                            claim = Some(Claim::new(link, mask));
-                        }
-                        _ => {
-                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-
-                let id = id.ok_or_else(|| serde::de::Error::custom("missing id"))?;
-                let timestamp =
-                    timestamp.ok_or_else(|| serde::de::Error::custom("missing timestamp"))?;
-                let claim = claim.ok_or_else(|| serde::de::Error::custom("missing claim"))?;
-
-                Ok(TxnHeader::new(id, timestamp, claim))
-            }
-        }
-
-        deserializer.deserialize_map(HeaderVisitor)
-    }
-}
-
-impl de::FromStream for TxnHeader {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct HeaderVisitor;
-
-        impl de::Visitor for HeaderVisitor {
-            type Value = TxnHeader;
-
-            fn expecting() -> &'static str {
-                "a transaction header map"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut id = None;
-                let mut timestamp = None;
-                let mut claim = None;
-
-                while let Some(key) = map.next_key::<String>(()).await? {
-                    match key.as_str() {
-                        "id" => {
-                            let value = map.next_value::<String>(()).await?;
-                            let parsed = TxnId::from_str(&value).map_err(de::Error::custom)?;
-                            id = Some(parsed);
-                        }
-                        "timestamp" => {
-                            let nanos = map.next_value::<u64>(()).await?;
-                            timestamp = Some(NetworkTime::from_nanos(nanos));
-                        }
-                        "claim" => {
-                            let (link, mask): (String, u32) = map.next_value(()).await?;
-                            let link = Link::from_str(&link)
-                                .map_err(|err| de::Error::custom(err.to_string()))?;
-                            let mask: umask::Mode = mask.into();
-                            claim = Some(Claim::new(link, mask));
-                        }
-                        _ => {
-                            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                        }
-                    }
-                }
-
-                let id = id.ok_or_else(|| de::Error::custom("missing id"))?;
-                let timestamp = timestamp.ok_or_else(|| de::Error::custom("missing timestamp"))?;
-                let claim = claim.ok_or_else(|| de::Error::custom("missing claim"))?;
-
-                Ok(TxnHeader::new(id, timestamp, claim))
-            }
-        }
-
-        decoder.decode_map(HeaderVisitor).await
-    }
-}
-
-impl<'en> en::IntoStream<'en> for TxnHeader {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let mut map = encoder.encode_map(Some(3))?;
-        map.encode_entry("id", self.id.to_string())?;
-        map.encode_entry("timestamp", self.timestamp.as_nanos())?;
-        let claim = (self.claim.link.to_string(), u32::from(self.claim.mask));
-        map.encode_entry("claim", claim)?;
-        map.end()
-    }
-}
-
-impl<'en> en::ToStream<'en> for TxnHeader {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
-    }
-}
-
-/// Authorization data issued by the control-plane / IAM stack.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Claim {
-    pub link: Link,
-    pub mask: umask::Mode,
-}
-
-impl Claim {
-    pub fn new(link: Link, mask: umask::Mode) -> Self {
-        Self { link, mask }
-    }
-
-    /// Return true if this claim grants the required mask.
-    pub fn allows(&self, link: &Link, required: umask::Mode) -> bool {
-        if self.link != *link {
-            return false;
-        }
-
-        let have: u32 = self.mask.into();
-        let need: u32 = required.into();
-        have & need == need
-    }
-}
-
-impl Serialize for Claim {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let tuple = (self.link.to_string(), u32::from(self.mask) as u16);
-        tuple.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Claim {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        <(String, u16)>::deserialize(deserializer).and_then(|(link, mask)| {
-            let link =
-                Link::from_str(&link).map_err(|err| serde::de::Error::custom(err.to_string()))?;
-            Ok(Claim {
-                link,
-                mask: (mask as u32).into(),
-            })
-        })
-    }
-}
-
-/// HTTP-like verbs supported by TinyChain routers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Method {
-    Get,
-    Put,
-    Post,
-    Delete,
-}
-
-/// IR analogue of `tc-transact`'s `Route` trait.
-pub trait Route {
-    type Handler;
-
-    /// Resolve the handler mounted at the given path.
-    fn route<'a>(&'a self, path: &'a [PathSegment]) -> Option<&'a Self::Handler>;
-}
-
-/// Marker trait implemented by every TinyChain handler.
-pub trait Handler<T>: Send + Sync
-where
-    T: Transaction + ?Sized,
-{
-    fn method_not_supported(method: Method) -> TCError {
-        TCError::method_not_allowed(method, std::any::type_name::<Self>())
-    }
-}
-
-impl<T, H> Handler<T> for H
-where
-    T: Transaction + ?Sized,
-    H: Send + Sync,
-{
-}
-
-#[cfg(feature = "pyo3-conversions")]
-pub trait FromPyRequest<'py>: Sized {
-    type PyError;
-
-    fn from_py(obj: &Bound<'py, PyAny>) -> Result<Self, Self::PyError>;
-}
-
-macro_rules! define_verb_handler {
-    ($trait_name:ident, $fn_name:ident, $method:expr) => {
-        pub trait $trait_name<T>: Handler<T>
-        where
-            T: Transaction + ?Sized,
-        {
-            type Request: de::FromStream<Context = Self::RequestContext>;
-            type RequestContext: Send;
-            type Response;
-            type Error;
-            type Fut<'a>: Future<Output = Result<Self::Response, Self::Error>> + Send + 'a
-            where
-                Self: 'a,
-                T: 'a,
-                Self::Request: 'a;
-
-            fn $fn_name<'a>(
-                &'a self,
-                txn: &'a T,
-                request: Self::Request,
-            ) -> TCResult<Self::Fut<'a>> {
-                let _ = (txn, request);
-                Err(Self::method_not_supported($method))
-            }
-        }
-    };
-}
-
-define_verb_handler!(HandleGet, get, Method::Get);
-define_verb_handler!(HandlePut, put, Method::Put);
-define_verb_handler!(HandlePost, post, Method::Post);
-define_verb_handler!(HandleDelete, delete, Method::Delete);
-
-/// Static description of a TinyChain library exposed through `/lib`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LibrarySchema {
-    id: Link,
-    version: String,
-    dependencies: Vec<Link>,
-}
-
-impl LibrarySchema {
-    /// Create a new schema with the given identifier, version, and dependency links.
-    pub fn new(id: Link, version: impl Into<String>, dependencies: Vec<Link>) -> Self {
-        Self {
-            id,
-            version: version.into(),
-            dependencies,
-        }
-    }
-
-    /// Unique library identifier (usually a `tc://` link).
-    pub fn id(&self) -> &Link {
-        &self.id
-    }
-
-    /// Version string advertised to runtimes.
-    pub fn version(&self) -> &str {
-        &self.version
-    }
-
-    /// Dependent libraries required for this module to load.
-    pub fn dependencies(&self) -> &[Link] {
-        &self.dependencies
-    }
-}
-
-impl de::FromStream for LibrarySchema {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct SchemaVisitor;
-
-        impl de::Visitor for SchemaVisitor {
-            type Value = LibrarySchema;
-
-            fn expecting() -> &'static str {
-                "a library schema map"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut id = None;
-                let mut version = None;
-                let mut dependencies = None;
-
-                while let Some(key) = map.next_key::<String>(()).await? {
-                    match key.as_str() {
-                        "id" => {
-                            if id.is_some() {
-                                return Err(de::Error::custom("duplicate id field"));
-                            }
-
-                            id = Some(map.next_value::<Link>(()).await?);
-                        }
-                        "version" => {
-                            if version.is_some() {
-                                return Err(de::Error::custom("duplicate version field"));
-                            }
-
-                            version = Some(map.next_value::<String>(()).await?);
-                        }
-                        "dependencies" => {
-                            dependencies = Some(map.next_value::<Vec<Link>>(()).await?);
-                        }
-                        _ => {
-                            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                        }
-                    }
-                }
-
-                let id = id.ok_or_else(|| de::Error::custom("missing id field"))?;
-                let version = version.ok_or_else(|| de::Error::custom("missing version field"))?;
-                let dependencies = dependencies.unwrap_or_default();
-
-                Ok(LibrarySchema::new(id, version, dependencies))
-            }
-        }
-
-        decoder.decode_map(SchemaVisitor).await
-    }
-}
-
-impl<'en> en::IntoStream<'en> for LibrarySchema {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let Self {
-            id,
-            version,
-            dependencies,
-        } = self;
-
-        let mut map = encoder.encode_map(Some(3))?;
-        map.encode_entry("id", id)?;
-        map.encode_entry("version", version)?;
-        map.encode_entry("dependencies", dependencies)?;
-        map.end()
-    }
-}
-
-impl<'en> en::ToStream<'en> for LibrarySchema {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
-    }
-}
-
-/// Scalar values exchanged via the TinyChain IR.
-///
-/// ## v1-compatible JSON semantics
-///
-/// This crate intentionally uses the v1 TinyChain reference encoding conventions when serialized
-/// via `destream_json`:
-///
-/// - A scalar value is encoded like a v1 scalar value (e.g. `null`, or a typed map like
-///   `{"\/state\/scalar\/value\/number": 3}`).
-/// - A reference is encoded as an op ref / TC ref map (see [`OpRef`] and [`TCRef`]).
-#[derive(Clone, Debug, PartialEq)]
-pub enum Scalar {
-    Value(Value),
-    Ref(Box<TCRef>),
-}
-
-/// A deterministic map type used by the TinyChain IR.
-///
-/// This is a v2 placeholder for the richer map/tuple scalar types from v1.
-pub type Map<T> = BTreeMap<String, T>;
-
-/// A reference to a named value in a scope (e.g. "$self").
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct IdRef(String);
-
-impl IdRef {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// The subject of an op.
-///
-/// Copied from the v1 `OpRef` model: an op may target either a concrete [`Link`] or a scoped
-/// reference plus a suffix path.
-///
-/// ## v1-compatible JSON semantics
-///
-/// Encoded as a string:
-///
-/// - A concrete [`Link`] encodes as its string form (e.g. `"/lib/acme/foo/1.0.0"`).
-/// - A scoped ref encodes as `"$id"` or `"$id/suffix/path"`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Subject {
-    Link(Link),
-    Ref(IdRef, PathBuf),
-}
-
-/// The data defining a reference to a GET op.
-pub type GetRef = (Subject, Scalar);
-
-/// The data defining a reference to a PUT op.
-pub type PutRef = (Subject, Scalar, Scalar);
-
-/// The data defining a reference to a POST op.
-pub type PostRef = (Subject, Map<Scalar>);
-
-/// The data defining a reference to a DELETE op.
-pub type DeleteRef = (Subject, Scalar);
-
-/// A reference to an op.
-///
-/// This is a structural port of the v1 `OpRef` enum. Resolution/execution is implemented by the
-/// host kernel and is intentionally not part of this type definition.
-///
-/// ## v1-compatible JSON semantics
-///
-/// Encoded as a single-entry map:
-///
-/// - GET: `{ "<subject>": [<key>] }`
-/// - PUT: `{ "<subject>": [<key>, <value>] }`
-/// - POST: `{ "<subject>": { "<name>": <value>, ... } }`
-/// - DELETE: `{ "/state/scalar/ref/op/delete": [<subject>, <key>] }`
-#[derive(Clone, Debug, PartialEq)]
-pub enum OpRef {
-    Get(GetRef),
-    Put(PutRef),
-    Post(PostRef),
-    Delete(DeleteRef),
-}
-
-/// A reference to a scalar value.
-///
-/// v2 currently supports only op references (`TCRef::Op`). Control-flow references (`If`, `While`,
-/// `Case`, etc.) will be added once the kernel has a complete ref scheduler.
-///
-/// ## v1-compatible JSON semantics
-///
-/// Encoded as the underlying [`OpRef`] map (no wrapper).
-#[derive(Clone, Debug, PartialEq)]
-pub enum TCRef {
-    Op(OpRef),
-}
-
-pub const OPREF_GET: PathLabel = path_label(&["state", "scalar", "ref", "op", "get"]);
-pub const OPREF_PUT: PathLabel = path_label(&["state", "scalar", "ref", "op", "put"]);
-pub const OPREF_POST: PathLabel = path_label(&["state", "scalar", "ref", "op", "post"]);
-pub const OPREF_DELETE: PathLabel = path_label(&["state", "scalar", "ref", "op", "delete"]);
-
-impl de::FromStream for IdRef {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        let id = String::from_stream((), decoder).await?;
-        Ok(Self::new(id))
-    }
-}
-
-impl<'en> en::IntoStream<'en> for IdRef {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.0.into_stream(encoder)
-    }
-}
-
-impl<'en> en::ToStream<'en> for IdRef {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.0.to_stream(encoder)
-    }
-}
-
-impl fmt::Display for IdRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl fmt::Display for Subject {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Subject::Link(link) => fmt::Display::fmt(link, f),
-            Subject::Ref(id, path) if path.is_empty() => fmt::Display::fmt(id, f),
-            Subject::Ref(id, path) => write!(f, "{id}{path}"),
-        }
-    }
-}
-
-impl de::FromStream for Subject {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        let s = String::from_stream((), decoder).await?;
-
-        subject_from_str(&s).map_err(|err| de::Error::custom(err.to_string()))
-    }
-}
-
-impl<'en> en::IntoStream<'en> for Subject {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.to_string().into_stream(encoder)
-    }
-}
-
-impl<'en> en::ToStream<'en> for Subject {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(self.to_string(), encoder)
-    }
-}
-
-impl de::FromStream for Scalar {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct ScalarVisitor;
-
-        impl de::Visitor for ScalarVisitor {
-            type Value = Scalar;
-
-            fn expecting() -> &'static str {
-                "a Scalar value or ref"
-            }
-
-            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::None))
-            }
-
-            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::None))
-            }
-
-            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::Number(Number::from(value))))
-            }
-
-            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::Number(Number::from(value))))
-            }
-
-            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::Number(Number::from(value))))
-            }
-
-            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::Number(Number::from(value))))
-            }
-
-            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::String(value)))
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let key = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("expected map key"))?;
-
-                if key.starts_with('/') {
-                    if let Ok(path) = PathBuf::from_str(&key) {
-                        if let Some(value_type) = ValueType::from_path(&path) {
-                            let value = match value_type {
-                                ValueType::None => {
-                                    let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                                    Value::None
-                                }
-                                ValueType::Number => {
-                                    let number = map.next_value::<Number>(()).await?;
-                                    Value::Number(number)
-                                }
-                                ValueType::String => {
-                                    let s = map.next_value::<String>(()).await?;
-                                    Value::String(s)
-                                }
-                            };
-
-                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                            }
-
-                            return Ok(Scalar::Value(value));
-                        }
-                    }
-                }
-
-                // Otherwise interpret this as a v1-style OpRef map and return a `Scalar::Ref`.
-                // Since this scalar type doesn't support general map/tuple values yet, this is the
-                // only supported non-`Value` map shape.
-                let op = decode_opref_map_entry(key, &mut map).await?;
-                Ok(Scalar::Ref(Box::new(TCRef::Op(op))))
-            }
-        }
-
-        decoder.decode_any(ScalarVisitor).await
-    }
-}
-
-impl<'en> en::IntoStream<'en> for Scalar {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Scalar::Value(value) => value.into_stream(encoder),
-            Scalar::Ref(r) => (*r).into_stream(encoder),
-        }
-    }
-}
-
-impl<'en> en::ToStream<'en> for Scalar {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
-    }
-}
-
-impl de::FromStream for OpRef {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct OpRefVisitor;
-
-        impl de::Visitor for OpRefVisitor {
-            type Value = OpRef;
-
-            fn expecting() -> &'static str {
-                "an OpRef map"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let key = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("expected OpRef, found empty map"))?;
-
-                decode_opref_map_entry(key, &mut map).await
-            }
-        }
-
-        decoder.decode_map(OpRefVisitor).await
-    }
-}
-
-impl<'en> en::IntoStream<'en> for OpRef {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            OpRef::Get((subject, key)) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_key(subject.to_string())?;
-                map.encode_value(ScalarSeq::new(vec![key]))?;
-                map.end()
-            }
-            OpRef::Put((subject, key, value)) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_key(subject.to_string())?;
-                map.encode_value(ScalarSeq::new(vec![key, value]))?;
-                map.end()
-            }
-            OpRef::Post((subject, params)) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(subject.to_string(), params)?;
-                map.end()
-            }
-            OpRef::Delete((subject, key)) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_key(PathBuf::from(OPREF_DELETE).to_string())?;
-                map.encode_value(SubjectScalarSeq::new(subject, key))?;
-                map.end()
-            }
-        }
-    }
-}
-
-impl<'en> en::ToStream<'en> for OpRef {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
-    }
-}
-
-impl de::FromStream for TCRef {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        OpRef::from_stream((), decoder).await.map(TCRef::Op)
-    }
-}
-
-impl<'en> en::IntoStream<'en> for TCRef {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            TCRef::Op(op) => op.into_stream(encoder),
-        }
-    }
-}
-
-impl<'en> en::ToStream<'en> for TCRef {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
-    }
-}
-
-struct ScalarSeq(Vec<Scalar>);
-
-impl ScalarSeq {
-    fn new(items: Vec<Scalar>) -> Self {
-        Self(items)
-    }
-}
-
-impl<'en> en::IntoStream<'en> for ScalarSeq {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeSeq;
-
-        let mut seq = encoder.encode_seq(Some(self.0.len()))?;
-        for item in self.0 {
-            seq.encode_element(item)?;
-        }
-        seq.end()
-    }
-}
-
-struct SubjectScalarSeq {
-    subject: Subject,
-    key: Scalar,
-}
-
-impl SubjectScalarSeq {
-    fn new(subject: Subject, key: Scalar) -> Self {
-        Self { subject, key }
-    }
-}
-
-impl<'en> en::IntoStream<'en> for SubjectScalarSeq {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeSeq;
-
-        let mut seq = encoder.encode_seq(Some(2))?;
-        seq.encode_element(self.subject)?;
-        seq.encode_element(self.key)?;
-        seq.end()
-    }
-}
-
-enum OpArgs {
-    Seq(Vec<Scalar>),
-    Map(Map<Scalar>),
-}
-
-impl de::FromStream for OpArgs {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct ArgsVisitor;
-
-        impl de::Visitor for ArgsVisitor {
-            type Value = OpArgs;
-
-            fn expecting() -> &'static str {
-                "OpRef args (a sequence or map)"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut params = Map::<Scalar>::new();
-                while let Some(key) = map.next_key::<String>(()).await? {
-                    let value = map.next_value::<Scalar>(()).await?;
-                    params.insert(key, value);
-                }
-                Ok(OpArgs::Map(params))
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut access: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut items = if let Some(len) = access.size_hint() {
-                    Vec::with_capacity(len)
-                } else {
-                    Vec::new()
-                };
-
-                while let Some(item) = access.next_element::<Scalar>(()).await? {
-                    items.push(item);
-                }
-
-                Ok(OpArgs::Seq(items))
-            }
-        }
-
-        decoder.decode_any(ArgsVisitor).await
-    }
-}
-
-fn subject_from_str(s: &str) -> Result<Subject, TCError> {
-    if s.starts_with('$') {
-        if let Some(i) = s.find('/') {
-            let id = &s[..i];
-            let path_str = &s[i..];
-            let path = PathBuf::from_str(path_str)
-                .map_err(|err| TCError::bad_request(err.to_string()))?;
-            Ok(Subject::Ref(IdRef::new(id.to_string()), path))
-        } else {
-            Ok(Subject::Ref(IdRef::new(s.to_string()), PathBuf::default()))
-        }
-    } else {
-        Link::from_str(s).map(Subject::Link).map_err(TCError::from)
-    }
-}
-
-async fn decode_opref_map_entry<A: de::MapAccess>(
-    key: String,
-    map: &mut A,
-) -> Result<OpRef, A::Error> {
-    let op = if key.starts_with('/') {
-        let path = PathBuf::from_str(&key).ok();
-
-        if path.as_ref() == Some(&PathBuf::from(OPREF_GET)) {
-            let get = map.next_value::<(Subject, Scalar)>(()).await?;
-            OpRef::Get(get)
-        } else if path.as_ref() == Some(&PathBuf::from(OPREF_PUT)) {
-            let put = map.next_value::<(Subject, Scalar, Scalar)>(()).await?;
-            OpRef::Put(put)
-        } else if path.as_ref() == Some(&PathBuf::from(OPREF_POST)) {
-            let post = map.next_value::<(Subject, Map<Scalar>)>(()).await?;
-            OpRef::Post(post)
-        } else if path.as_ref() == Some(&PathBuf::from(OPREF_DELETE)) {
-            let delete = map.next_value::<(Subject, Scalar)>(()).await?;
-            OpRef::Delete(delete)
-        } else {
-            let subject =
-                subject_from_str(&key).map_err(|err| de::Error::custom(err.to_string()))?;
-
-            let args = map.next_value::<OpArgs>(()).await?;
-            match args {
-                OpArgs::Map(params) => OpRef::Post((subject, params)),
-                OpArgs::Seq(items) => match items.as_slice() {
-                    [key] => OpRef::Get((subject, key.clone())),
-                    [key, value] => OpRef::Put((subject, key.clone(), value.clone())),
-                    _ => {
-                        return Err(de::Error::custom(
-                            "invalid OpRef params (expected 1 or 2 elements)",
-                        ));
-                    }
-                },
-            }
-        }
-    } else {
-        let subject = subject_from_str(&key).map_err(|err| de::Error::custom(err.to_string()))?;
-
-        let args = map.next_value::<OpArgs>(()).await?;
-        match args {
-            OpArgs::Map(params) => OpRef::Post((subject, params)),
-            OpArgs::Seq(items) => match items.as_slice() {
-                [key] => OpRef::Get((subject, key.clone())),
-                [key, value] => OpRef::Put((subject, key.clone(), value.clone())),
-                _ => {
-                    return Err(de::Error::custom(
-                        "invalid OpRef params (expected 1 or 2 elements)",
-                    ));
-                }
-            },
-        }
-    };
-
-    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-        let _ = map.next_value::<de::IgnoredAny>(()).await?;
-    }
-
-    Ok(op)
-}
-
-impl Default for Scalar {
-    fn default() -> Self {
-        Scalar::Value(Value::default())
-    }
-}
-
-impl From<Value> for Scalar {
-    fn from(value: Value) -> Self {
-        Scalar::Value(value)
-    }
-}
-
-impl From<TCRef> for Scalar {
-    fn from(value: TCRef) -> Self {
-        Scalar::Ref(Box::new(value))
-    }
-}
-
-impl From<u64> for Scalar {
-    fn from(value: u64) -> Self {
-        Scalar::Value(Value::from(value))
-    }
-}
-
-/// Directory-style router inspired by TinyChain's transactional `Dir`.
-#[derive(Default)]
-pub struct Dir<H> {
-    entries: BTreeMap<PathSegment, DirEntry<H>>,
-}
-
-enum DirEntry<H> {
-    Dir(Box<Dir<H>>),
-    Handler(H),
-}
-
-impl<H: Clone> Clone for Dir<H> {
-    fn clone(&self) -> Self {
-        Self {
-            entries: self.entries.clone(),
-        }
-    }
-}
-
-impl<H: Clone> Clone for DirEntry<H> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Dir(dir) => Self::Dir(Box::new((**dir).clone())),
-            Self::Handler(handler) => Self::Handler(handler.clone()),
-        }
-    }
-}
-
-impl<H: fmt::Debug> fmt::Debug for Dir<H> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_map().entries(self.entries.iter()).finish()
-    }
-}
-
-impl<H: fmt::Debug> fmt::Debug for DirEntry<H> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Dir(_) => f.write_str("Dir(...)"),
-            Self::Handler(handler) => f.debug_tuple("Handler").field(handler).finish(),
-        }
-    }
-}
-
-impl<H> Dir<H> {
-    pub fn new() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-        }
-    }
-
-    /// Build a directory from a collection of `(path, handler)` entries.
-    pub fn from_routes<I>(routes: I) -> TCResult<Self>
-    where
-        I: IntoIterator<Item = (Vec<PathSegment>, H)>,
-    {
-        let mut dir = Self::new();
-        for (path, handler) in routes {
-            if path.is_empty() {
-                return Err(TCError::bad_request("cannot mount handler at root"));
-            }
-            dir.insert_segments(&path, handler)?;
-        }
-        Ok(dir)
-    }
-
-    fn insert_segments(&mut self, path: &[PathSegment], handler: H) -> TCResult<()> {
-        let (head, tail) = path
-            .split_first()
-            .expect("caller ensures path is non-empty");
-
-        use std::collections::btree_map::Entry;
-
-        if tail.is_empty() {
-            match self.entries.entry(head.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(DirEntry::Handler(handler));
-                    Ok(())
-                }
-                Entry::Occupied(_) => Err(TCError::bad_request(format!(
-                    "handler already mounted at path {}",
-                    format_path(path)
-                ))),
-            }
-        } else {
-            let entry = self.entries.entry(head.clone()).or_insert_with(|| {
-                DirEntry::Dir(Box::new(Dir {
-                    entries: BTreeMap::new(),
-                }))
-            });
-
-            match entry {
-                DirEntry::Dir(dir) => dir.insert_segments(tail, handler),
-                DirEntry::Handler(_) => Err(TCError::bad_request(format!(
-                    "cannot mount handler below a leaf handler at {}",
-                    format_path(path)
-                ))),
-            }
-        }
-    }
-
-    fn route_path<'a>(&'a self, path: &'a [PathSegment]) -> Option<&'a H> {
-        let (head, tail) = path.split_first()?;
-        match self.entries.get(head) {
-            Some(DirEntry::Handler(handler)) if tail.is_empty() => Some(handler),
-            Some(DirEntry::Dir(dir)) => dir.route_path(tail),
-            _ => None,
-        }
-    }
-}
-
-impl<H> Route for Dir<H> {
-    type Handler = H;
-
-    fn route<'a>(&'a self, path: &'a [PathSegment]) -> Option<&'a Self::Handler> {
-        self.route_path(path)
-    }
-}
-
-fn format_path(path: &[PathSegment]) -> String {
-    Path::from(path).to_string()
-}
-
-/// Parse a `/foo/bar`-style path into [`PathSegment`]s for use with a [`Dir`].
-pub fn parse_route_path(path: &str) -> TCResult<Vec<PathSegment>> {
-    if path.is_empty() {
-        return Err(TCError::bad_request("route paths must not be empty"));
-    }
-
-    let trimmed = path.trim();
-    let trimmed = trimmed.strip_prefix('/').unwrap_or(trimmed);
-    if trimmed.is_empty() {
-        return Err(TCError::bad_request(
-            "route paths must contain at least one segment",
-        ));
-    }
-
-    trimmed
-        .split('/')
-        .map(|segment| {
-            PathSegment::from_str(segment).map_err(|cause| {
-                TCError::bad_request(format!("invalid route segment '{segment}': {cause}"))
-            })
-        })
-        .collect()
-}
-
-/// Build a [`Dir`] from string routes with minimal boilerplate.
-#[macro_export]
-macro_rules! tc_library_routes {
-    ($($path:expr => $handler:expr),+ $(,)?) => {{
-        (|| -> tc_error::TCResult<_> {
-            let routes = vec![
-                $(
-                    ($crate::parse_route_path($path)?, $handler)
-                ),+
-            ];
-            $crate::Dir::from_routes(routes)
-        })()
-    }};
-}
-
-/// Convenience wrapper that pairs a schema with a reusable routing table.
-pub struct LibraryModule<Txn: ?Sized, Routes> {
-    schema: LibrarySchema,
-    routes: Routes,
-    _txn: PhantomData<Txn>,
-}
-
-impl<Txn: ?Sized, Routes> LibraryModule<Txn, Routes>
-where
-    Txn: Transaction,
-    Routes: Route,
-{
-    /// Construct a new [`LibraryModule`].
-    pub fn new(schema: LibrarySchema, routes: Routes) -> Self {
-        Self {
-            schema,
-            routes,
-            _txn: PhantomData,
-        }
-    }
-}
-
-impl<Txn: ?Sized, Routes> Library for LibraryModule<Txn, Routes>
-where
-    Txn: Transaction,
-    Routes: Route,
-{
-    type Txn = Txn;
-    type Routes = Routes;
-
-    fn schema(&self) -> &LibrarySchema {
-        &self.schema
-    }
-
-    fn routes(&self) -> &Self::Routes {
-        &self.routes
-    }
-}
-
-/// Backwards-compatible alias for the previous `StaticLibrary` type name.
-pub type StaticLibrary<Txn, Routes> = LibraryModule<Txn, Routes>;
-
-/// Trait implemented by every TinyChain library, whether native or WASM-backed.
-pub trait Library {
-    type Txn: Transaction + ?Sized;
-    type Routes: Route;
-
-    /// Schema returned by `/lib`.
-    fn schema(&self) -> &LibrarySchema;
-
-    /// Root routing table used to dispatch runtime requests.
-    fn routes(&self) -> &Self::Routes;
-}
+mod library;
+pub use library::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::pin::Pin;
+
+    use std::{future::Future, pin::Pin, str::FromStr};
+
+    use number_general::Number;
+    use pathlink::{Link, PathSegment};
+    use tc_error::TCResult;
+    use tc_value::Value;
 
     #[derive(Clone)]
     struct FakeTxn {
@@ -1477,6 +178,104 @@ mod tests {
     }
 
     #[test]
+    fn scalar_map_roundtrip() {
+        let mut inner = Map::new();
+        inner.insert(
+            "signed".parse().expect("Id"),
+            Scalar::from(Value::from(Number::from(true))),
+        );
+        inner.insert("bits".parse().expect("Id"), Scalar::from(16_u64));
+
+        let mut outer = Map::new();
+        outer.insert("dtype".parse().expect("Id"), Scalar::from(Value::from("f32")));
+        outer.insert("encoding".parse().expect("Id"), Scalar::Map(inner));
+
+        let scalar = Scalar::Map(outer);
+
+        let encoded = destream_json::encode(scalar.clone()).expect("encode scalar map");
+        let decoded: Scalar = futures::executor::block_on(destream_json::try_decode((), encoded))
+            .expect("decode scalar map");
+
+        assert_eq!(decoded, scalar);
+    }
+
+    #[test]
+    fn scalar_tuple_roundtrip() {
+        let scalar = Scalar::Tuple(vec![Scalar::from(7_u64), Scalar::from(Value::from("x"))]);
+
+        let encoded = destream_json::encode(scalar.clone()).expect("encode scalar tuple");
+        let decoded: Scalar = futures::executor::block_on(destream_json::try_decode((), encoded))
+            .expect("decode scalar tuple");
+
+        assert_eq!(decoded, scalar);
+    }
+
+    #[test]
+    fn scalar_opref_decodes_as_ref() {
+        let link = Link::from_str("/lib/acme/foo/1.0.0").expect("link");
+        let op = OpRef::Get((Subject::Link(link), Scalar::default()));
+        let scalar = Scalar::from(TCRef::Op(op));
+
+        let encoded = destream_json::encode(scalar.clone()).expect("encode scalar ref");
+        let decoded: Scalar = futures::executor::block_on(destream_json::try_decode((), encoded))
+            .expect("decode scalar ref");
+
+        assert_eq!(decoded, scalar);
+    }
+
+    #[test]
+    fn opdef_roundtrip() {
+        let form = vec![
+            ("x".parse().expect("Id"), Scalar::from(7_u64)),
+            ("y".parse().expect("Id"), Scalar::from(Value::from("z"))),
+        ];
+        let op = OpDef::Post(form);
+
+        let encoded = destream_json::encode(op.clone()).expect("encode opdef");
+        let decoded: OpDef =
+            futures::executor::block_on(destream_json::try_decode((), encoded))
+                .expect("decode opdef");
+
+        assert_eq!(decoded, op);
+    }
+
+    #[test]
+    fn tcref_id_roundtrip() {
+        let tcref = TCRef::Id("$foo".parse().expect("IdRef"));
+        let encoded = destream_json::encode(tcref.clone()).expect("encode tcref id");
+        let decoded: TCRef =
+            futures::executor::block_on(destream_json::try_decode((), encoded))
+                .expect("decode tcref id");
+        assert_eq!(decoded, tcref);
+    }
+
+    #[test]
+    fn tcref_while_roundtrip() {
+        let cond = Scalar::from(1_u64);
+        let closure = Scalar::from(Value::from("step"));
+        let state = Scalar::from(7_u64);
+        let tcref = TCRef::While(Box::new(While::new(cond, closure, state)));
+        let encoded = destream_json::encode(tcref.clone()).expect("encode tcref while");
+        let decoded: TCRef =
+            futures::executor::block_on(destream_json::try_decode((), encoded))
+                .expect("decode tcref while");
+        assert_eq!(decoded, tcref);
+    }
+
+    #[test]
+    fn tcref_if_roundtrip() {
+        let cond = TCRef::Id("$flag".parse().expect("IdRef"));
+        let then = Scalar::from(Value::from("yes"));
+        let or_else = Scalar::from(Value::from("no"));
+        let tcref = TCRef::If(Box::new(IfRef::new(cond, then, or_else)));
+        let encoded = destream_json::encode(tcref.clone()).expect("encode tcref if");
+        let decoded: TCRef =
+            futures::executor::block_on(destream_json::try_decode((), encoded))
+                .expect("decode tcref if");
+        assert_eq!(decoded, tcref);
+    }
+
+    #[test]
     fn static_library_wraps_schema_and_routes() {
         let schema = LibrarySchema::new(Link::from_str("/lib/service").unwrap(), "1.0.0", vec![]);
         let routes = tc_library_routes! {
@@ -1489,4 +288,21 @@ mod tests {
         let path = [segment("lib"), segment("status")];
         assert!(lib.routes().route(&path).is_some());
     }
+
+    #[test]
+    fn map_require_optional() {
+        let mut map: Map<u64> = Map::new();
+        map.insert("answer".parse().expect("Id"), 42);
+
+        assert_eq!(map.optional("missing").expect("optional"), None);
+        assert_eq!(map.optional("answer").expect("optional"), Some(42));
+
+        map.insert("answer".parse().expect("Id"), 42);
+        assert_eq!(map.require("answer").expect("require"), 42);
+        assert!(map.is_empty());
+
+        let err = map.require("answer").unwrap_err();
+        assert!(err.message().contains("missing answer parameter"));
+    }
 }
+
