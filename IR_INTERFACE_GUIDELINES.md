@@ -48,6 +48,12 @@ The proposed payload and its design constraints live in `tc-ir/OP_GRAPH_IR.md`.
   `[cond, closure, state]`, mirroring v1 semantics.
 - `TCRef::If` is encoded as `/state/scalar/ref/if` with `[cond, then, or_else]`, where
   `cond` is a scalar ref and the branches are arbitrary scalars.
+- `TCRef::Cond` is encoded as `/state/scalar/ref/cond` with `[cond, then_op, else_op]`, where
+  `cond` is a scalar ref and each branch is an OpDef executed lazily.
+- `TCRef::ForEach` is encoded as `/state/scalar/ref/for_each` with `[items, op, item_name]`,
+  where `items` is a scalar collection (tuple or map), `op` is an OpDef, and `item_name` is a
+  string Id used as the item parameter when invoking `op`. When `items` is a map, iteration
+  yields keys in deterministic `Id` order.
 - The loop condition and closure are OpDefs, executed with a loop-carried `state` input.
 
 ## Error & backpressure expectations

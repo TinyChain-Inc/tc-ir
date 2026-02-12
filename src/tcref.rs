@@ -3,7 +3,8 @@ use std::str::FromStr;
 use destream::{de, en, IntoStream};
 use pathlink::PathBuf;
 
-use crate::{IdRef, Scalar};
+use crate::{Id, IdRef, Scalar};
+use tc_value::Value;
 
 /// A reference to a scalar value.
 ///
@@ -15,11 +16,14 @@ use crate::{IdRef, Scalar};
 ///
 /// Encoded as the underlying [`crate::OpRef`] map (no wrapper).
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum TCRef {
     Op(crate::op::OpRef),
     Id(IdRef),
     If(Box<IfRef>),
+    Cond(Box<CondOp>),
     While(Box<While>),
+    ForEach(Box<ForEach>),
 }
 
 /// A conditional reference (`if cond then then else or_else`).
@@ -33,6 +37,77 @@ pub struct IfRef {
 impl IfRef {
     pub fn new(cond: TCRef, then: Scalar, or_else: Scalar) -> Self {
         Self { cond, then, or_else }
+    }
+}
+
+/// A lazy conditional reference: evaluate `cond` and execute only the selected branch OpDef.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CondOp {
+    pub cond: TCRef,
+    pub then: crate::op::OpDef,
+    pub or_else: crate::op::OpDef,
+}
+
+impl CondOp {
+    pub fn new(cond: TCRef, then: crate::op::OpDef, or_else: crate::op::OpDef) -> Self {
+        Self { cond, then, or_else }
+    }
+}
+
+struct CondOpArgs {
+    cond: Scalar,
+    then: crate::op::OpDef,
+    or_else: crate::op::OpDef,
+}
+
+impl de::FromStream for CondOpArgs {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(
+        _context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        struct CondOpArgsVisitor;
+
+        impl de::Visitor for CondOpArgsVisitor {
+            type Value = CondOpArgs;
+
+            fn expecting() -> &'static str {
+                "a CondOp args tuple"
+            }
+
+            async fn visit_seq<A: de::SeqAccess>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let cond = seq
+                    .next_element::<Scalar>(())
+                    .await?
+                    .ok_or_else(|| de::Error::custom("invalid CondOp params (missing condition)"))?;
+                let then = seq
+                    .next_element::<crate::op::OpDef>(())
+                    .await?
+                    .ok_or_else(|| de::Error::custom("invalid CondOp params (missing then op)"))?;
+                let or_else = seq
+                    .next_element::<crate::op::OpDef>(())
+                    .await?
+                    .ok_or_else(|| de::Error::custom("invalid CondOp params (missing else op)"))?;
+
+                if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
+                    return Err(de::Error::custom(
+                        "invalid CondOp params (expected 3 elements)",
+                    ));
+                }
+
+                Ok(CondOpArgs {
+                    cond,
+                    then,
+                    or_else,
+                })
+            }
+        }
+
+        decoder.decode_seq(CondOpArgsVisitor).await
     }
 }
 
@@ -50,6 +125,24 @@ impl While {
             cond,
             closure,
             state,
+        }
+    }
+}
+
+/// A `ForEach` reference: apply `op` to each item in `items`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForEach {
+    pub items: Scalar,
+    pub op: Scalar,
+    pub item_name: Id,
+}
+
+impl ForEach {
+    pub fn new(items: Scalar, op: Scalar, item_name: Id) -> Self {
+        Self {
+            items,
+            op,
+            item_name,
         }
     }
 }
@@ -93,7 +186,9 @@ impl<'en> en::IntoStream<'en> for TCRef {
             TCRef::Op(op) => op.into_stream(encoder),
             TCRef::Id(id_ref) => encode_id_ref(id_ref, encoder),
             TCRef::If(if_ref) => encode_if_ref(*if_ref, encoder),
+            TCRef::Cond(cond_op) => encode_cond_op(*cond_op, encoder),
             TCRef::While(while_ref) => encode_while_ref(*while_ref, encoder),
+            TCRef::ForEach(for_each) => encode_for_each_ref(*for_each, encoder),
         }
     }
 }
@@ -108,7 +203,12 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
     key: String,
     map: &mut A,
 ) -> Result<TCRef, A::Error> {
-    if key == PathBuf::from(crate::TCREF_IF).to_string() {
+    let key_path = if key.starts_with('/') {
+        PathBuf::from_str(&key).ok()
+    } else {
+        None
+    };
+    if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_IF)) {
         let items = map.next_value::<Vec<Scalar>>(()).await?;
         let mut iter = items.into_iter();
         let (cond, then, or_else) = match (iter.next(), iter.next(), iter.next(), iter.next()) {
@@ -136,7 +236,28 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
         return Ok(TCRef::If(Box::new(IfRef::new(cond, then, or_else))));
     }
 
-    if key == PathBuf::from(crate::TCREF_WHILE).to_string() {
+    if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_COND)) {
+        let args = map.next_value::<CondOpArgs>(()).await?;
+
+        let cond = match args.cond {
+            Scalar::Ref(r) => *r,
+            other => {
+                return Err(de::Error::custom(format!(
+                    "invalid CondOp condition (expected ref, got {other:?})"
+                )))
+            }
+        };
+
+        while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+            let _ = map.next_value::<de::IgnoredAny>(()).await?;
+        }
+
+        return Ok(TCRef::Cond(Box::new(CondOp::new(
+            cond, args.then, args.or_else,
+        ))));
+    }
+
+    if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_WHILE)) {
         let items = map.next_value::<Vec<Scalar>>(()).await?;
         let mut iter = items.into_iter();
         let (cond, closure, state) = match (iter.next(), iter.next(), iter.next(), iter.next()) {
@@ -153,6 +274,38 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
         }
 
         return Ok(TCRef::While(Box::new(While::new(cond, closure, state))));
+    }
+
+    if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_FOR_EACH)) {
+        let items = map.next_value::<Vec<Scalar>>(()).await?;
+        let mut iter = items.into_iter();
+        let (items, op, item_name) = match (iter.next(), iter.next(), iter.next(), iter.next()) {
+            (Some(items), Some(op), Some(item_name), None) => (items, op, item_name),
+            _ => {
+                return Err(de::Error::custom(
+                    "invalid ForEach ref params (expected 3 elements)",
+                ))
+            }
+        };
+
+        let item_name = match item_name {
+            Scalar::Value(Value::String(raw)) => raw
+                .parse::<Id>()
+                .map_err(|err| de::Error::custom(err.to_string()))?,
+            other => {
+                return Err(de::Error::custom(format!(
+                    "invalid ForEach item_name (expected string, got {other:?})"
+                )))
+            }
+        };
+
+        while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+            let _ = map.next_value::<de::IgnoredAny>(()).await?;
+        }
+
+        return Ok(TCRef::ForEach(Box::new(ForEach::new(
+            items, op, item_name,
+        ))));
     }
 
     if key.starts_with('$') {
@@ -195,6 +348,30 @@ impl<'en> en::IntoStream<'en> for ScalarSeq {
     }
 }
 
+struct CondOpSeq {
+    cond: TCRef,
+    then: crate::op::OpDef,
+    or_else: crate::op::OpDef,
+}
+
+impl CondOpSeq {
+    fn new(cond: TCRef, then: crate::op::OpDef, or_else: crate::op::OpDef) -> Self {
+        Self { cond, then, or_else }
+    }
+}
+
+impl<'en> en::IntoStream<'en> for CondOpSeq {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        use destream::en::EncodeSeq;
+
+        let mut seq = encoder.encode_seq(Some(3))?;
+        seq.encode_element(Scalar::from(self.cond))?;
+        seq.encode_element(self.then)?;
+        seq.encode_element(self.or_else)?;
+        seq.end()
+    }
+}
+
 fn encode_id_ref<'en, E: en::Encoder<'en>>(id_ref: IdRef, encoder: E) -> Result<E::Ok, E::Error> {
     use destream::en::EncodeMap;
 
@@ -217,6 +394,15 @@ fn encode_if_ref<'en, E: en::Encoder<'en>>(if_ref: IfRef, encoder: E) -> Result<
     map.end()
 }
 
+fn encode_cond_op<'en, E: en::Encoder<'en>>(cond_op: CondOp, encoder: E) -> Result<E::Ok, E::Error> {
+    use destream::en::EncodeMap;
+
+    let mut map = encoder.encode_map(Some(1))?;
+    map.encode_key(PathBuf::from(crate::TCREF_COND).to_string())?;
+    map.encode_value(CondOpSeq::new(cond_op.cond, cond_op.then, cond_op.or_else))?;
+    map.end()
+}
+
 fn encode_while_ref<'en, E: en::Encoder<'en>>(
     while_ref: While,
     encoder: E,
@@ -233,3 +419,18 @@ fn encode_while_ref<'en, E: en::Encoder<'en>>(
     map.end()
 }
 
+fn encode_for_each_ref<'en, E: en::Encoder<'en>>(
+    for_each: ForEach,
+    encoder: E,
+) -> Result<E::Ok, E::Error> {
+    use destream::en::EncodeMap;
+
+    let mut map = encoder.encode_map(Some(1))?;
+    map.encode_key(PathBuf::from(crate::TCREF_FOR_EACH).to_string())?;
+    map.encode_value(ScalarSeq::new(vec![
+        for_each.items,
+        for_each.op,
+        Scalar::Value(Value::String(for_each.item_name.to_string())),
+    ]))?;
+    map.end()
+}

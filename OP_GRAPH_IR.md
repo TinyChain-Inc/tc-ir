@@ -192,6 +192,78 @@ pub struct OpGraph {
 }
 ```
 
+---
+
+## 1.x) Lazy conditional evaluation (v1-aligned design note)
+
+### Problem statement
+
+Autograph lowers `if` branches into a single `OpDef` where branch expressions are evaluated eagerly. This
+forces non-total operations (e.g. tuple `get(0)`, `head`, `tail`) to execute even when the branch is not
+taken, causing runtime failures. v1 users expect `if` branches to be lazy.
+
+### v1 continuity choices
+
+- Keep the existing eager `IfRef` (`/state/scalar/ref/if`) for cases where both branches are total.
+- Introduce a **lazy** conditional ref for branch OpDefs to preserve v1 expectations of branch semantics.
+- Follow v1 naming patterns for boolean ops (`and`, `or`, `not`, `xor`) and avoid reusing bitwise dunders.
+
+### New IR ref: `CondOp` (lazy)
+
+**Name:** `CondOp` (lazy conditional)
+
+**Encoding:** `/state/scalar/ref/cond`
+
+**Shape:** `(cond_ref, then_opdef, else_opdef)`
+
+- `cond_ref`: a `TCRef` that resolves to a boolean scalar (same as v1 boolean ops).
+- `then_opdef`: `OpDef` executed only when condition is true.
+- `else_opdef`: `OpDef` executed only when condition is false.
+
+**Semantics:**
+1. Resolve `cond_ref`.
+2. Execute **only** the selected branch OpDef.
+3. Return the branch `result` scalar.
+
+This mirrors v1’s behavioral expectation (branch expressions are not evaluated unless selected),
+without changing the eager `IfRef` behavior.
+
+### Autograph lowering (v1-aligned)
+
+Autograph should lower `if` assignments into `CondOp` rather than eager `IfRef` when:
+- The branch body contains non-total ops (indexing, head/tail, slice), or
+- The branch is generated from Python control flow (default).
+
+**Design choice (ab initio minimal):**
+- **Lower each `if` block to a single `CondOp` that returns a map of all assigned names.**
+- Both branch `OpDef`s return the same map keys, even if one branch computes a value via a
+  default/identity expression.
+- After the `CondOp`, bind each assigned name by `get` from the returned map.
+
+Rationale: a single lazy `CondOp` per `if` block is the minimal general form that guarantees
+branch-local evaluation while keeping the IR surface area small. Per-assignment `CondOp`s
+either re-evaluate conditions or force eager evaluation of dependencies, which breaks v1
+branch semantics and complicates scheduling. A map result preserves topological order and
+keeps name-binding explicit.
+
+### Host execution requirements
+
+Host resolvers should:
+- Support `/state/scalar/ref/cond` by executing only the selected branch `OpDef`.
+- Preserve eager `IfRef` for total expressions (legacy use).
+
+### Compatibility & migration
+
+- Existing graphs using `IfRef` remain valid.
+- Autograph will prefer `CondOp` for correctness; manual authors can still use `IfRef` for total expressions.
+
+### Validation
+
+When validating Autograph + `CondOp` changes, run `cargo test -p tc-ir` and the
+relevant downstream integration tests (e.g., Python client flows) for the affected
+paths.
+
+
 #### Determinism constraints
 
 An `OpGraph` is well-formed iff:

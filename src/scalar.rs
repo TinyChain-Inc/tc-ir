@@ -99,14 +99,16 @@ pub const OPREF_PUT: PathLabel = path_label(&["state", "scalar", "ref", "op", "p
 pub const OPREF_POST: PathLabel = path_label(&["state", "scalar", "ref", "op", "post"]);
 pub const OPREF_DELETE: PathLabel = path_label(&["state", "scalar", "ref", "op", "delete"]);
 pub const TCREF_IF: PathLabel = path_label(&["state", "scalar", "ref", "if"]);
+pub const TCREF_COND: PathLabel = path_label(&["state", "scalar", "ref", "cond"]);
 pub const TCREF_WHILE: PathLabel = path_label(&["state", "scalar", "ref", "while"]);
+pub const TCREF_FOR_EACH: PathLabel = path_label(&["state", "scalar", "ref", "for_each"]);
 pub const OPDEF_GET: PathLabel = path_label(&["state", "scalar", "op", "get"]);
 pub const OPDEF_PUT: PathLabel = path_label(&["state", "scalar", "op", "put"]);
 pub const OPDEF_POST: PathLabel = path_label(&["state", "scalar", "op", "post"]);
 pub const OPDEF_DELETE: PathLabel = path_label(&["state", "scalar", "op", "delete"]);
 pub const SCALAR_REFLECT_CLASS: PathLabel = path_label(&["state", "scalar", "reflect", "class"]);
-pub const SCALAR_REFLECT_IF_PARTS: PathLabel =
-    path_label(&["state", "scalar", "reflect", "if_parts"]);
+pub const SCALAR_REFLECT_REF_PARTS: PathLabel =
+    path_label(&["state", "scalar", "reflect", "ref_parts"]);
 pub const OPDEF_REFLECT_FORM: PathLabel = path_label(&["state", "scalar", "op", "reflect", "form"]);
 pub const OPDEF_REFLECT_LAST_ID: PathLabel =
     path_label(&["state", "scalar", "op", "reflect", "last_id"]);
@@ -285,12 +287,21 @@ impl de::FromStream for Scalar {
                         }
                     }
 
-                    if key == PathBuf::from(TCREF_IF).to_string()
-                        || key == PathBuf::from(TCREF_WHILE).to_string()
-                        || key == PathBuf::from(OPREF_DELETE).to_string()
-                    {
-                        let r = crate::tcref::decode_tcref_map_entry(key, &mut map).await?;
-                        return Ok(Scalar::Ref(Box::new(r)));
+                    let key_path = if key.starts_with('/') {
+                        PathBuf::from_str(&key).ok()
+                    } else {
+                        None
+                    };
+                    if let Some(key_path) = key_path {
+                        if key_path == PathBuf::from(TCREF_IF)
+                            || key_path == PathBuf::from(TCREF_COND)
+                            || key_path == PathBuf::from(TCREF_WHILE)
+                            || key_path == PathBuf::from(TCREF_FOR_EACH)
+                            || key_path == PathBuf::from(OPREF_DELETE)
+                        {
+                            let r = crate::tcref::decode_tcref_map_entry(key, &mut map).await?;
+                            return Ok(Scalar::Ref(Box::new(r)));
+                        }
                     }
 
                     let args = map.next_value::<crate::op::OpArgs>(()).await?;
