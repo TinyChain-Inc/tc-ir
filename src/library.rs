@@ -175,4 +175,3 @@ pub trait Library {
     /// Root routing table used to dispatch runtime requests.
     fn routes(&self) -> &Self::Routes;
 }
-

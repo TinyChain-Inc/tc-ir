@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
+use crate::{Id, Map, Scalar, Subject};
 use destream::{de, en, EncodeMap, IntoStream};
 use pathlink::PathBuf;
-use crate::{Id, Map, Scalar, Subject};
 
 /// The data defining a reference to a GET op.
 pub type GetRef = (Subject, Scalar);
@@ -140,8 +140,8 @@ impl de::FromStream for OpDef {
                     .next_key::<String>(())
                     .await?
                     .ok_or_else(|| de::Error::custom("expected Op definition type"))?;
-                let path = PathBuf::from_str(&key)
-                    .map_err(|err| de::Error::custom(err.to_string()))?;
+                let path =
+                    PathBuf::from_str(&key).map_err(|err| de::Error::custom(err.to_string()))?;
                 let op_def_type = OpDefType::from_path(&path).ok_or_else(|| {
                     de::Error::custom("expected Op definition type, e.g. \"/state/scalar/op/get\"")
                 })?;

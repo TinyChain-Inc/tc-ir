@@ -382,8 +382,7 @@ pub(crate) fn subject_from_str(s: &str) -> Result<Subject, TCError> {
                 IdRef::from_str(id).map_err(|err| TCError::bad_request(err.to_string()))?;
             Ok(Subject::Ref(id_ref, path))
         } else {
-            let id_ref =
-                IdRef::from_str(s).map_err(|err| TCError::bad_request(err.to_string()))?;
+            let id_ref = IdRef::from_str(s).map_err(|err| TCError::bad_request(err.to_string()))?;
             Ok(Subject::Ref(id_ref, PathBuf::default()))
         }
     } else {

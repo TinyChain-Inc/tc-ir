@@ -36,7 +36,11 @@ pub struct IfRef {
 
 impl IfRef {
     pub fn new(cond: TCRef, then: Scalar, or_else: Scalar) -> Self {
-        Self { cond, then, or_else }
+        Self {
+            cond,
+            then,
+            or_else,
+        }
     }
 }
 
@@ -50,7 +54,11 @@ pub struct CondOp {
 
 impl CondOp {
     pub fn new(cond: TCRef, then: crate::op::OpDef, or_else: crate::op::OpDef) -> Self {
-        Self { cond, then, or_else }
+        Self {
+            cond,
+            then,
+            or_else,
+        }
     }
 }
 
@@ -80,10 +88,9 @@ impl de::FromStream for CondOpArgs {
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
-                let cond = seq
-                    .next_element::<Scalar>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("invalid CondOp params (missing condition)"))?;
+                let cond = seq.next_element::<Scalar>(()).await?.ok_or_else(|| {
+                    de::Error::custom("invalid CondOp params (missing condition)")
+                })?;
                 let then = seq
                     .next_element::<crate::op::OpDef>(())
                     .await?
@@ -253,7 +260,9 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
         }
 
         return Ok(TCRef::Cond(Box::new(CondOp::new(
-            cond, args.then, args.or_else,
+            cond,
+            args.then,
+            args.or_else,
         ))));
     }
 
@@ -303,9 +312,7 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
             let _ = map.next_value::<de::IgnoredAny>(()).await?;
         }
 
-        return Ok(TCRef::ForEach(Box::new(ForEach::new(
-            items, op, item_name,
-        ))));
+        return Ok(TCRef::ForEach(Box::new(ForEach::new(items, op, item_name))));
     }
 
     if key.starts_with('$') {
@@ -318,8 +325,8 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
             }
         }
 
-        let subject =
-            crate::scalar::subject_from_str(&key).map_err(|err| de::Error::custom(err.to_string()))?;
+        let subject = crate::scalar::subject_from_str(&key)
+            .map_err(|err| de::Error::custom(err.to_string()))?;
         let op = crate::op::opref_from_subject_args(subject, args)?;
         return Ok(TCRef::Op(op));
     }
@@ -356,7 +363,11 @@ struct CondOpSeq {
 
 impl CondOpSeq {
     fn new(cond: TCRef, then: crate::op::OpDef, or_else: crate::op::OpDef) -> Self {
-        Self { cond, then, or_else }
+        Self {
+            cond,
+            then,
+            or_else,
+        }
     }
 }
 
@@ -394,7 +405,10 @@ fn encode_if_ref<'en, E: en::Encoder<'en>>(if_ref: IfRef, encoder: E) -> Result<
     map.end()
 }
 
-fn encode_cond_op<'en, E: en::Encoder<'en>>(cond_op: CondOp, encoder: E) -> Result<E::Ok, E::Error> {
+fn encode_cond_op<'en, E: en::Encoder<'en>>(
+    cond_op: CondOp,
+    encoder: E,
+) -> Result<E::Ok, E::Error> {
     use destream::en::EncodeMap;
 
     let mut map = encoder.encode_map(Some(1))?;

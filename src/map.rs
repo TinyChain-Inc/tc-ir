@@ -52,18 +52,18 @@ impl<T> Map<T> {
 
     /// Remove and return the parameter with the given `name`, or `None` if not present.
     pub fn optional(&mut self, name: &str) -> TCResult<Option<T>> {
-        let id: Id = name.parse().map_err(|err| {
-            TCError::bad_request(format!("invalid map key id {name:?}: {err}"))
-        })?;
+        let id: Id = name
+            .parse()
+            .map_err(|err| TCError::bad_request(format!("invalid map key id {name:?}: {err}")))?;
 
         Ok(self.remove(&id))
     }
 
     /// Remove and return the parameter with the given `name`, or a "not found" error.
     pub fn require(&mut self, name: &str) -> TCResult<T> {
-        let id: Id = name.parse().map_err(|err| {
-            TCError::bad_request(format!("invalid map key id {name:?}: {err}"))
-        })?;
+        let id: Id = name
+            .parse()
+            .map_err(|err| TCError::bad_request(format!("invalid map key id {name:?}: {err}")))?;
 
         self.remove(&id)
             .ok_or_else(|| TCError::not_found(format!("missing {name} parameter")))
@@ -172,4 +172,3 @@ impl<'en, T: en::ToStream<'en> + 'en> en::ToStream<'en> for Map<T> {
         self.inner.to_stream(encoder)
     }
 }
-

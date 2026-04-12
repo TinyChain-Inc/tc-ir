@@ -187,7 +187,10 @@ mod tests {
         inner.insert("bits".parse().expect("Id"), Scalar::from(16_u64));
 
         let mut outer = Map::new();
-        outer.insert("dtype".parse().expect("Id"), Scalar::from(Value::from("f32")));
+        outer.insert(
+            "dtype".parse().expect("Id"),
+            Scalar::from(Value::from("f32")),
+        );
         outer.insert("encoding".parse().expect("Id"), Scalar::Map(inner));
 
         let scalar = Scalar::Map(outer);
@@ -232,9 +235,8 @@ mod tests {
         let op = OpDef::Post(form);
 
         let encoded = destream_json::encode(op.clone()).expect("encode opdef");
-        let decoded: OpDef =
-            futures::executor::block_on(destream_json::try_decode((), encoded))
-                .expect("decode opdef");
+        let decoded: OpDef = futures::executor::block_on(destream_json::try_decode((), encoded))
+            .expect("decode opdef");
 
         assert_eq!(decoded, op);
     }
@@ -243,9 +245,8 @@ mod tests {
     fn tcref_id_roundtrip() {
         let tcref = TCRef::Id("$foo".parse().expect("IdRef"));
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref id");
-        let decoded: TCRef =
-            futures::executor::block_on(destream_json::try_decode((), encoded))
-                .expect("decode tcref id");
+        let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
+            .expect("decode tcref id");
         assert_eq!(decoded, tcref);
     }
 
@@ -256,9 +257,8 @@ mod tests {
         let state = Scalar::from(7_u64);
         let tcref = TCRef::While(Box::new(While::new(cond, closure, state)));
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref while");
-        let decoded: TCRef =
-            futures::executor::block_on(destream_json::try_decode((), encoded))
-                .expect("decode tcref while");
+        let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
+            .expect("decode tcref while");
         assert_eq!(decoded, tcref);
     }
 
@@ -269,9 +269,8 @@ mod tests {
         let or_else = Scalar::from(Value::from("no"));
         let tcref = TCRef::If(Box::new(IfRef::new(cond, then, or_else)));
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref if");
-        let decoded: TCRef =
-            futures::executor::block_on(destream_json::try_decode((), encoded))
-                .expect("decode tcref if");
+        let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
+            .expect("decode tcref if");
         assert_eq!(decoded, tcref);
     }
 
@@ -305,4 +304,3 @@ mod tests {
         assert!(err.message().contains("missing answer parameter"));
     }
 }
-
