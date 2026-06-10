@@ -204,44 +204,47 @@ taken, causing runtime failures. v1 users expect `if` branches to be lazy.
 
 ### v1 continuity choices
 
-- Keep the existing eager `IfRef` (`/state/scalar/ref/if`) for cases where both branches are total.
-- Introduce a **lazy** conditional ref for branch OpDefs to preserve v1 expectations of branch semantics.
+- Use a single conditional ref, `Cond`, as the canonical representation.
+- Preserve decode compatibility for legacy `/state/scalar/ref/if` payloads by normalizing them to `Cond`.
 - Follow v1 naming patterns for boolean ops (`and`, `or`, `not`, `xor`) and avoid reusing bitwise dunders.
 
-### New IR ref: `CondOp` (lazy)
+### Canonical IR ref: `Cond`
 
-**Name:** `CondOp` (lazy conditional)
+**Name:** `Cond` (conditional)
 
 **Encoding:** `/state/scalar/ref/cond`
 
-**Shape:** `(cond_ref, then_opdef, else_opdef)`
+**Shape:** `(cond_ref, then_scalar, else_scalar)`
 
 - `cond_ref`: a `TCRef` that resolves to a boolean scalar (same as v1 boolean ops).
-- `then_opdef`: `OpDef` executed only when condition is true.
-- `else_opdef`: `OpDef` executed only when condition is false.
+- `then_scalar`: any scalar value.
+- `else_scalar`: any scalar value.
+
+If a selected branch scalar is an `OpDef` scalar, the host executes that op lazily.
 
 **Semantics:**
 1. Resolve `cond_ref`.
-2. Execute **only** the selected branch OpDef.
-3. Return the branch `result` scalar.
+2. Select exactly one branch.
+3. If the selected branch is an `OpDef` scalar, execute it lazily; otherwise resolve the scalar directly.
+4. Return the selected branch result.
 
 This mirrors v1’s behavioral expectation (branch expressions are not evaluated unless selected),
-without changing the eager `IfRef` behavior.
+while keeping one conditional type.
 
 ### Autograph lowering (v1-aligned)
 
-Autograph should lower `if` assignments into `CondOp` rather than eager `IfRef` when:
+Autograph should lower `if` assignments into `Cond` when:
 - The branch body contains non-total ops (indexing, head/tail, slice), or
 - The branch is generated from Python control flow (default).
 
 **Design choice (ab initio minimal):**
-- **Lower each `if` block to a single `CondOp` that returns a map of all assigned names.**
+- **Lower each `if` block to a single `Cond` that returns a map of all assigned names.**
 - Both branch `OpDef`s return the same map keys, even if one branch computes a value via a
   default/identity expression.
-- After the `CondOp`, bind each assigned name by `get` from the returned map.
+- After the `Cond`, bind each assigned name by `get` from the returned map.
 
-Rationale: a single lazy `CondOp` per `if` block is the minimal general form that guarantees
-branch-local evaluation while keeping the IR surface area small. Per-assignment `CondOp`s
+Rationale: a single lazy `Cond` per `if` block is the minimal general form that guarantees
+branch-local evaluation while keeping the IR surface area small. Per-assignment conditionals
 either re-evaluate conditions or force eager evaluation of dependencies, which breaks v1
 branch semantics and complicates scheduling. A map result preserves topological order and
 keeps name-binding explicit.
@@ -249,17 +252,18 @@ keeps name-binding explicit.
 ### Host execution requirements
 
 Host resolvers should:
-- Support `/state/scalar/ref/cond` by executing only the selected branch `OpDef`.
-- Preserve eager `IfRef` for total expressions (legacy use).
+- Support `/state/scalar/ref/cond` by evaluating only the selected branch.
+- Execute a selected branch lazily when it is encoded as an `OpDef` scalar.
+- Accept `/state/scalar/ref/if` during decode for legacy compatibility.
 
 ### Compatibility & migration
 
-- Existing graphs using `IfRef` remain valid.
-- Autograph will prefer `CondOp` for correctness; manual authors can still use `IfRef` for total expressions.
+- Existing graphs using `/state/scalar/ref/if` remain valid at decode time.
+- Canonical encode output uses `/state/scalar/ref/cond`.
 
 ### Validation
 
-When validating Autograph + `CondOp` changes, run `cargo test -p tc-ir` and the
+When validating Autograph + `Cond` changes, run `cargo test -p tc-ir` and the
 relevant downstream integration tests (e.g., Python client flows) for the affected
 paths.
 

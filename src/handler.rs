@@ -47,6 +47,37 @@ pub trait FromPyRequest<'py>: Sized {
     fn from_py(obj: &pyo3::Bound<'py, pyo3::PyAny>) -> Result<Self, Self::PyError>;
 }
 
+/// Shared extraction trait for PyO3-native request/response paths.
+///
+/// This is the scalable replacement for per-type ad-hoc conversion impls. Runtime crates can
+/// implement these traits close to each type family (e.g. Value, Collection, State) and compose
+/// them through enum visitors rather than centralizing every concrete type in one adapter module.
+#[cfg(feature = "pyo3-conversions")]
+pub trait PyExtract<'py>: Sized {
+    type PyError;
+
+    fn py_extract(obj: &pyo3::Bound<'py, pyo3::PyAny>) -> Result<Self, Self::PyError>;
+}
+
+#[cfg(feature = "pyo3-conversions")]
+pub trait PyProject {
+    type PyError;
+
+    fn py_project(self, py: pyo3::Python<'_>) -> Result<pyo3::Py<pyo3::PyAny>, Self::PyError>;
+}
+
+#[cfg(feature = "pyo3-conversions")]
+impl<'py, T> FromPyRequest<'py> for T
+where
+    T: PyExtract<'py>,
+{
+    type PyError = T::PyError;
+
+    fn from_py(obj: &pyo3::Bound<'py, pyo3::PyAny>) -> Result<Self, Self::PyError> {
+        T::py_extract(obj)
+    }
+}
+
 macro_rules! define_verb_handler {
     ($trait_name:ident, $fn_name:ident, $method:expr) => {
         pub trait $trait_name<T>: Handler<T>

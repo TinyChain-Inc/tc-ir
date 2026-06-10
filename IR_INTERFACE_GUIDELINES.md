@@ -34,6 +34,18 @@ Bindings should hide these details from user code but must honor them under the 
 - Handlers may not rely on local wall-clock time; they should use transaction-provided timestamps.
 - Inputs and outputs must be serializable with a `destream`.
 
+## Execution ordering model
+
+- TinyChain executes by dataflow dependency, not by lexical/source order.
+- Independent nodes may execute concurrently when they have no dependency edge.
+- A dependency edge exists when one node consumes another node's output, or when
+  the graph includes an explicit ordering reference.
+
+For side effects, ordering must be explicit. Bindings and compilers must not infer
+or synthesize side-effect sequencing from statement order. Developers must add an
+explicit `After` reference whenever two side-effecting operations require order
+and no natural data dependency already enforces it.
+
 ## Op-graph payloads
 
 TinyChain v2 supports a transport-neutral op-graph payload intended to make workloads **inspectable**
@@ -46,10 +58,11 @@ The proposed payload and its design constraints live in `tc-ir/OP_GRAPH_IR.md`.
 
 - `TCRef::While` is encoded as `/state/scalar/ref/while` with a three-element tuple
   `[cond, closure, state]`, mirroring v1 semantics.
-- `TCRef::If` is encoded as `/state/scalar/ref/if` with `[cond, then, or_else]`, where
-  `cond` is a scalar ref and the branches are arbitrary scalars.
-- `TCRef::Cond` is encoded as `/state/scalar/ref/cond` with `[cond, then_op, else_op]`, where
-  `cond` is a scalar ref and each branch is an OpDef executed lazily.
+- `TCRef::Cond` is the canonical conditional ref, encoded as `/state/scalar/ref/cond`
+  with `[cond, then, or_else]`, where `cond` is a scalar ref and each branch is
+  any scalar (including an `OpDef` scalar for lazy branch execution).
+- Legacy payloads encoded as `/state/scalar/ref/if` are accepted for decode compatibility
+  and normalized to `TCRef::Cond` in-memory.
 - `TCRef::ForEach` is encoded as `/state/scalar/ref/for_each` with `[items, op, item_name]`,
   where `items` is a scalar collection (tuple or map), `op` is an OpDef, and `item_name` is a
   string Id used as the item parameter when invoking `op`. When `items` is a map, iteration

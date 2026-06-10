@@ -36,10 +36,9 @@ pub use library::*;
 mod tests {
     use super::*;
 
-    use std::{future::Future, pin::Pin, str::FromStr};
+    use std::{collections::BTreeMap, future::Future, pin::Pin, str::FromStr};
 
-    use number_general::Number;
-    use pathlink::{Link, PathSegment};
+    use pathlink::{Link, PathBuf, PathSegment};
     use tc_error::TCResult;
     use tc_value::Value;
 
@@ -182,7 +181,7 @@ mod tests {
         let mut inner = Map::new();
         inner.insert(
             "signed".parse().expect("Id"),
-            Scalar::from(Value::from(Number::from(true))),
+            Scalar::from(Value::Bool(true)),
         );
         inner.insert("bits".parse().expect("Id"), Scalar::from(16_u64));
 
@@ -227,6 +226,23 @@ mod tests {
     }
 
     #[test]
+    fn scalar_typed_opref_get_key_decodes_as_ref() {
+        let subject = Subject::Link(Link::from_str("/lib/acme/foo/1.0.0").expect("link"));
+        let key = Scalar::from(Value::from("k"));
+        let mut encoded_map = BTreeMap::new();
+        encoded_map.insert(PathBuf::from(OPREF_GET).to_string(), (subject.clone(), key.clone()));
+
+        let encoded = destream_json::encode(encoded_map).expect("encode typed opref get");
+        let decoded: Scalar = futures::executor::block_on(destream_json::try_decode((), encoded))
+            .expect("decode typed opref get as scalar");
+
+        assert_eq!(
+            decoded,
+            Scalar::from(TCRef::Op(OpRef::Get((subject, key))))
+        );
+    }
+
+    #[test]
     fn opdef_roundtrip() {
         let form = vec![
             ("x".parse().expect("Id"), Scalar::from(7_u64)),
@@ -263,14 +279,54 @@ mod tests {
     }
 
     #[test]
-    fn tcref_if_roundtrip() {
+    fn tcref_if_decodes_to_cond() {
         let cond = TCRef::Id("$flag".parse().expect("IdRef"));
         let then = Scalar::from(Value::from("yes"));
         let or_else = Scalar::from(Value::from("no"));
-        let tcref = TCRef::If(Box::new(IfRef::new(cond, then, or_else)));
-        let encoded = destream_json::encode(tcref.clone()).expect("encode tcref if");
+        let encoded = destream_json::encode(std::collections::BTreeMap::from([(
+            PathBuf::from(TCREF_IF).to_string(),
+            vec![Scalar::from(cond.clone()), then.clone(), or_else.clone()],
+        )]))
+        .expect("encode legacy if map");
         let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
             .expect("decode tcref if");
+        assert_eq!(decoded, TCRef::Cond(Box::new(Cond::new(cond, then, or_else))));
+    }
+
+    #[test]
+    fn tcref_cond_roundtrip() {
+        let cond = TCRef::Id("$flag".parse().expect("IdRef"));
+        let then = Scalar::Op(OpDef::Post(vec![(
+            "result".parse().expect("Id"),
+            Scalar::from(1_u64),
+        )]));
+        let or_else = Scalar::Op(OpDef::Post(vec![(
+            "result".parse().expect("Id"),
+            Scalar::from(0_u64),
+        )]));
+        let tcref = TCRef::Cond(Box::new(Cond::new(cond, then, or_else)));
+
+        let encoded = destream_json::encode(tcref.clone()).expect("encode tcref cond");
+        let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
+            .expect("decode tcref cond");
+
+        assert_eq!(decoded, tcref);
+    }
+
+    #[test]
+    fn tcref_for_each_roundtrip() {
+        let items = Scalar::Tuple(vec![Scalar::from(1_u64), Scalar::from(2_u64)]);
+        let op = Scalar::Op(OpDef::Post(vec![(
+            "result".parse().expect("Id"),
+            Scalar::from(TCRef::Id("$item".parse().expect("IdRef"))),
+        )]));
+        let item_name = "item".parse().expect("Id");
+        let tcref = TCRef::ForEach(Box::new(ForEach::new(items, op, item_name)));
+
+        let encoded = destream_json::encode(tcref.clone()).expect("encode tcref for_each");
+        let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
+            .expect("decode tcref for_each");
+
         assert_eq!(decoded, tcref);
     }
 

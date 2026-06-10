@@ -205,7 +205,7 @@ impl de::FromStream for Scalar {
             }
 
             fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::Number(Number::from(value))))
+                Ok(Scalar::Value(Value::Bool(value)))
             }
 
             fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
@@ -253,6 +253,10 @@ impl de::FromStream for Scalar {
                     if let Ok(path) = PathBuf::from_str(&key) {
                         if let Some(value_type) = ValueType::from_path(&path) {
                             let value = match value_type {
+                                ValueType::Bool => {
+                                    let value = map.next_value::<bool>(()).await?;
+                                    Value::Bool(value)
+                                }
                                 ValueType::None => {
                                     let _ = map.next_value::<de::IgnoredAny>(()).await?;
                                     Value::None
@@ -270,6 +274,14 @@ impl de::FromStream for Scalar {
                                     let link = Link::from_str(&raw)
                                         .map_err(|err| de::Error::custom(err.to_string()))?;
                                     Value::Link(link)
+                                }
+                                ValueType::Map => {
+                                    let nested = map.next_value::<std::collections::BTreeMap<String, Value>>(()).await?;
+                                    Value::Map(nested)
+                                }
+                                ValueType::Tuple => {
+                                    let nested = map.next_value::<Vec<Value>>(()).await?;
+                                    Value::Tuple(nested)
                                 }
                             };
 
@@ -297,6 +309,9 @@ impl de::FromStream for Scalar {
                             || key_path == PathBuf::from(TCREF_COND)
                             || key_path == PathBuf::from(TCREF_WHILE)
                             || key_path == PathBuf::from(TCREF_FOR_EACH)
+                            || key_path == PathBuf::from(OPREF_GET)
+                            || key_path == PathBuf::from(OPREF_PUT)
+                            || key_path == PathBuf::from(OPREF_POST)
                             || key_path == PathBuf::from(OPREF_DELETE)
                         {
                             let r = crate::tcref::decode_tcref_map_entry(key, &mut map).await?;
