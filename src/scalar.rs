@@ -253,6 +253,10 @@ impl de::FromStream for Scalar {
                     if let Ok(path) = PathBuf::from_str(&key) {
                         if let Some(value_type) = ValueType::from_path(&path) {
                             let value = match value_type {
+                                ValueType::Bool => {
+                                    let value = map.next_value::<bool>(()).await?;
+                                    Value::Bool(value)
+                                }
                                 ValueType::None => {
                                     let _ = map.next_value::<de::IgnoredAny>(()).await?;
                                     Value::None
