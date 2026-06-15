@@ -276,7 +276,9 @@ impl de::FromStream for Scalar {
                                     Value::Link(link)
                                 }
                                 ValueType::Map => {
-                                    let nested = map.next_value::<std::collections::BTreeMap<String, Value>>(()).await?;
+                                    let nested = map
+                                        .next_value::<std::collections::BTreeMap<String, Value>>(())
+                                        .await?;
                                     Value::Map(nested)
                                 }
                                 ValueType::Tuple => {
