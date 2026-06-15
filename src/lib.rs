@@ -244,16 +244,16 @@ mod tests {
         let subject = Subject::Link(Link::from_str("/lib/acme/foo/1.0.0").expect("link"));
         let key = Scalar::from(Value::from("k"));
         let mut encoded_map = BTreeMap::new();
-        encoded_map.insert(PathBuf::from(OPREF_GET).to_string(), (subject.clone(), key.clone()));
+        encoded_map.insert(
+            PathBuf::from(OPREF_GET).to_string(),
+            (subject.clone(), key.clone()),
+        );
 
         let encoded = destream_json::encode(encoded_map).expect("encode typed opref get");
         let decoded: Scalar = futures::executor::block_on(destream_json::try_decode((), encoded))
             .expect("decode typed opref get as scalar");
 
-        assert_eq!(
-            decoded,
-            Scalar::from(TCRef::Op(OpRef::Get((subject, key))))
-        );
+        assert_eq!(decoded, Scalar::from(TCRef::Op(OpRef::Get((subject, key)))));
     }
 
     #[test]
@@ -304,7 +304,10 @@ mod tests {
         .expect("encode legacy if map");
         let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
             .expect("decode tcref if");
-        assert_eq!(decoded, TCRef::Cond(Box::new(Cond::new(cond, then, or_else))));
+        assert_eq!(
+            decoded,
+            TCRef::Cond(Box::new(Cond::new(cond, then, or_else)))
+        );
     }
 
     #[test]
