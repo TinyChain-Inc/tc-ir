@@ -38,6 +38,7 @@ mod tests {
 
     use std::{collections::BTreeMap, future::Future, pin::Pin, str::FromStr};
 
+    use number_general::Number;
     use pathlink::{Link, PathBuf, PathSegment};
     use tc_error::TCResult;
     use tc_value::Value;
@@ -129,6 +130,19 @@ mod tests {
         assert_eq!(decoded, header);
     }
 
+    #[test]
+    fn txn_id_round_trips_with_trace() {
+        let txn_id = TxnId::from_parts(NetworkTime::from_nanos(7), 1).with_trace([3; 32]);
+        let parsed = TxnId::from_str(&txn_id.to_string()).expect("parse txn id");
+
+        assert_eq!(parsed, txn_id);
+    }
+
+    #[test]
+    fn txn_id_rejects_partial_wire_id_without_trace() {
+        assert!(TxnId::from_str("7-1").is_err());
+    }
+
     fn segment(name: &str) -> PathSegment {
         PathSegment::from_str(name).expect("path segment")
     }
@@ -181,7 +195,7 @@ mod tests {
         let mut inner = Map::new();
         inner.insert(
             "signed".parse().expect("Id"),
-            Scalar::from(Value::Bool(true)),
+            Scalar::from(Value::Number(Number::Bool(true.into()))),
         );
         inner.insert("bits".parse().expect("Id"), Scalar::from(16_u64));
 

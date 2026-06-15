@@ -72,9 +72,19 @@ impl TxnId {
     }
 }
 
+fn decode_hex_byte(pair: &str) -> Result<u8, &'static str> {
+    u8::from_str_radix(pair, 16).map_err(|_| "invalid TxnId trace")
+}
+
 impl fmt::Display for TxnId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", self.timestamp, self.nonce)
+        write!(f, "{}-{}-", self.timestamp, self.nonce)?;
+
+        for byte in self.trace {
+            write!(f, "{byte:02x}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -82,16 +92,31 @@ impl FromStr for TxnId {
     type Err = &'static str;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (ts, nonce) = s
-            .split_once('-')
-            .ok_or("transaction IDs must look like `<timestamp>-<nonce>`")?;
+        let mut parts = s.split('-');
+        let ts = parts.next().ok_or("missing TxnId timestamp")?;
+        let nonce = parts.next().ok_or("missing TxnId nonce")?;
+        let trace_hex = parts.next().ok_or("missing TxnId trace")?;
+
+        if parts.next().is_some() {
+            return Err("transaction IDs must look like `<timestamp>-<nonce>-<tracehex>`");
+        }
+
+        if trace_hex.len() != 64 {
+            return Err("TxnId trace must be 32 bytes encoded as lowercase hex");
+        }
 
         let timestamp = NetworkTime::from_nanos(ts.parse().map_err(|_| "invalid TxnId timestamp")?);
         let nonce = nonce
             .parse()
             .map_err(|_| "invalid TxnId nonce (expected u16)")?;
+        let mut trace = [0u8; 32];
 
-        Ok(Self::from_parts(timestamp, nonce))
+        for (index, byte) in trace.iter_mut().enumerate() {
+            let offset = index * 2;
+            *byte = decode_hex_byte(&trace_hex[offset..offset + 2])?;
+        }
+
+        Ok(Self::from_parts(timestamp, nonce).with_trace(trace))
     }
 }
 
