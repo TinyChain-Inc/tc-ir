@@ -32,6 +32,17 @@ pub use dir::*;
 mod library;
 pub use library::*;
 
+pub mod tensor;
+pub use tensor::{
+    broadcast_shapes, matmul_output_shape, validate_permutation, NodeId, TensorDtype, TensorGraph,
+    TensorIrError, TensorNode, TensorOp, TensorTypeSpec, ValueId,
+};
+
+pub mod autodiff;
+pub use autodiff::{
+    AutodiffError, AutodiffRequest, AutodiffResult, DerivativeMetadata,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
