@@ -253,10 +253,6 @@ impl de::FromStream for Scalar {
                     if let Ok(path) = PathBuf::from_str(&key) {
                         if let Some(value_type) = ValueType::from_path(&path) {
                             let value = match value_type {
-                                ValueType::Bool => {
-                                    let value = map.next_value::<bool>(()).await?;
-                                    Value::Bool(value)
-                                }
                                 ValueType::None => {
                                     let _ = map.next_value::<de::IgnoredAny>(()).await?;
                                     Value::None
@@ -274,16 +270,6 @@ impl de::FromStream for Scalar {
                                     let link = Link::from_str(&raw)
                                         .map_err(|err| de::Error::custom(err.to_string()))?;
                                     Value::Link(link)
-                                }
-                                ValueType::Map => {
-                                    let nested = map
-                                        .next_value::<std::collections::BTreeMap<String, Value>>(())
-                                        .await?;
-                                    Value::Map(nested)
-                                }
-                                ValueType::Tuple => {
-                                    let nested = map.next_value::<Vec<Value>>(()).await?;
-                                    Value::Tuple(nested)
                                 }
                             };
 

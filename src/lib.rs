@@ -32,6 +32,13 @@ pub use dir::*;
 mod library;
 pub use library::*;
 
+// Boundary invariant (FR-004 / TASK-IR-009): tc-ir does not define
+// AutodiffRequest, AutodiffResult, DerivativeMetadata, or AutodiffError.
+// Those types are owned by the client package.
+pub mod tensor;
+pub use tensor::{NodeId, ValueId, TensorDtype, TensorTypeSpec, TensorOp, TensorNode, TensorGraph};
+pub use tensor::{broadcast_shapes, broadcast_reduce_axes, matmul_shape, validate_perm, ShapeError};
+
 #[cfg(test)]
 mod tests {
     use super::*;

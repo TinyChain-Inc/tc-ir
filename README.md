@@ -19,6 +19,12 @@ HTTP, PyO3, WASM, or future transports.
 - **Examples.** `examples/hello_library.rs` demonstrates how to build a native
   library module and dispatch handlers without HTTP. WASM-facing examples live
   under `tc-wasm/examples`.
+- **Tensor vocabulary.** `tc_ir::tensor` exports the stable typed tensor graph IR:
+  `TensorGraph`, `TensorOp`, `TensorDtype`, `TensorTypeSpec`, `NodeId`, `ValueId`,
+  and shape helpers (`broadcast_shapes`, `broadcast_reduce_axes`, `matmul_shape`,
+  `validate_perm`). Autodiff protocol types (`AutodiffRequest`, `AutodiffResult`,
+  `DerivativeMetadata`, `AutodiffError`) are not part of this crate — they are
+  Python client dataclasses.
 
 See `AGENTS.md` for design constraints (dependency hygiene, backward
 compatibility) and `IR_INTERFACE_GUIDELINES.md` for field-by-field documentation.

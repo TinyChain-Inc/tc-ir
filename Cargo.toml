@@ -13,9 +13,9 @@ destream = "0.10"
 hr-id = { version = "0.7", features = ["stream"] }
 serde = { version = "1", features = ["derive"] }
 umask = "2.1"
-pathlink = { path = "../deps/pathlink", features = ["stream"] }
+pathlink = { version = "0.4", features = ["stream"] }
 tc-error = "0.13"
-tc-value = { path = "../tc-value" }
+tc-value = { path = "../ilc-api/tc-value" }
 number-general = { version = "0.14", default-features = false, features = ["stream"] }
 pyo3 = { version = "0.21", optional = true }
 

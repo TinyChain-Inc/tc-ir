@@ -90,3 +90,19 @@ The proposed payload and its design constraints live in `tc-ir/OP_GRAPH_IR.md`.
   - Trait implementors must treat capability bits as the sole source of truth for what an operation may do; no handler should hard-code policy independent of the control plane.
   - When the control plane updates capability definitions or tenant policies, bindings must be able to reload the new policy bundle without code changes.
 - The IR guidelines here define how handlers *consume* authorization; the actual issuance, validation, and rotation flows remain centralized in the control-plane/a16z server stack. Any divergence between the two must be treated as a compatibility bug.
+
+## Tensor vocabulary
+
+`tc-ir` owns the stable, transport-neutral tensor operation vocabulary. The following types are public API in `tc_ir::tensor`:
+
+- **`TensorOp`** — canonical tensor operators (`Add`, `BroadcastReduce`, `Matmul`, `Transpose`). Each variant carries its input `ValueId`(s) and operation-specific parameters. `TensorOp::canonical_name()` returns the stable lowercase wire key used in the JSON map entry.
+- **`TensorDtype`** — floating-point element types (`F32`, `F64`).
+- **`TensorTypeSpec`** — pairs a `TensorDtype` with a shape (`Vec<Option<usize>>`), where `None` represents a dynamic dimension.
+- **`NodeId`** / **`ValueId`** — string-backed newtypes that uniquely identify computation nodes and the tensor values they produce within a `TensorGraph`.
+- **`TensorNode`** — one computation step: associates a `NodeId` with a `TensorOp`, an output `ValueId`, and an output `TensorTypeSpec`.
+- **`TensorGraph`** — the complete typed computation graph: named inputs with type specs, a topologically ordered list of `TensorNode`s, and named output `ValueId`s.
+- **Shape helpers** — `broadcast_shapes`, `broadcast_reduce_axes`, `matmul_shape`, `validate_perm` implement NumPy/ONNX-compatible shape inference and are exported from the crate root.
+
+Wire format entry point: a `TensorGraph` serializes as a JSON map `{"inputs": [...], "outputs": [...], "nodes": [...]}`. Each `TensorNode` serializes as a map; each `TensorOp` serializes as a single-entry map keyed by `canonical_name()`.
+
+**What `tc-ir` does NOT own:** `AutodiffRequest`, `AutodiffResult`, `DerivativeMetadata`, and `AutodiffError` are Python client dataclasses defined and owned by the autodiff transform system per FR-004. They must not be defined in this crate.
