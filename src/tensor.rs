@@ -187,13 +187,13 @@ impl<'en> en::ToStream<'en> for TensorDtype {
 // ====== DimSize helper ======
 
 /// Stream-layer newtype for a single optional dimension (null = dynamic).
-struct DimSize(Option<usize>);
+struct DimSize(Option<u64>);
 
 impl<'en> en::IntoStream<'en> for DimSize {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self.0 {
             None => encoder.encode_none(),
-            Some(n) => encoder.encode_u64(n as u64),
+            Some(n) => encoder.encode_u64(n),
         }
     }
 }
@@ -219,26 +219,26 @@ impl de::FromStream for DimSize {
             }
 
             fn visit_u8<E: de::Error>(self, v: u8) -> Result<Self::Value, E> {
-                Ok(DimSize(Some(v as usize)))
+                Ok(DimSize(Some(v as u64)))
             }
 
             fn visit_u16<E: de::Error>(self, v: u16) -> Result<Self::Value, E> {
-                Ok(DimSize(Some(v as usize)))
+                Ok(DimSize(Some(v as u64)))
             }
 
             fn visit_u32<E: de::Error>(self, v: u32) -> Result<Self::Value, E> {
-                Ok(DimSize(Some(v as usize)))
+                Ok(DimSize(Some(v as u64)))
             }
 
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(DimSize(Some(v as usize)))
+                Ok(DimSize(Some(v)))
             }
 
             fn visit_i32<E: de::Error>(self, v: i32) -> Result<Self::Value, E> {
                 if v < 0 {
                     Err(de::Error::custom("dimension size cannot be negative"))
                 } else {
-                    Ok(DimSize(Some(v as usize)))
+                    Ok(DimSize(Some(v as u64)))
                 }
             }
 
@@ -246,7 +246,7 @@ impl de::FromStream for DimSize {
                 if v < 0 {
                     Err(de::Error::custom("dimension size cannot be negative"))
                 } else {
-                    Ok(DimSize(Some(v as usize)))
+                    Ok(DimSize(Some(v as u64)))
                 }
             }
         }
@@ -257,7 +257,7 @@ impl de::FromStream for DimSize {
 
 // ====== ShapeSeq helper ======
 
-struct ShapeSeq(Vec<Option<usize>>);
+struct ShapeSeq(Vec<Option<u64>>);
 
 impl<'en> en::IntoStream<'en> for ShapeSeq {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
@@ -271,13 +271,13 @@ impl<'en> en::IntoStream<'en> for ShapeSeq {
 
 // ====== UsizeSeq helper ======
 
-struct UsizeSeq(Vec<usize>);
+struct UsizeSeq(Vec<u64>);
 
 impl<'en> en::IntoStream<'en> for UsizeSeq {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         let mut seq = encoder.encode_seq(Some(self.0.len()))?;
         for n in self.0 {
-            seq.encode_element(n as u64)?;
+            seq.encode_element(n)?
         }
         seq.end()
     }
@@ -291,11 +291,11 @@ impl<'en> en::IntoStream<'en> for UsizeSeq {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TensorTypeSpec {
     pub dtype: TensorDtype,
-    pub shape: Vec<Option<usize>>,
+    pub shape: Vec<Option<u64>>,
 }
 
 impl TensorTypeSpec {
-    pub fn new(dtype: TensorDtype, shape: Vec<Option<usize>>) -> Self {
+    pub fn new(dtype: TensorDtype, shape: Vec<Option<u64>>) -> Self {
         Self { dtype, shape }
     }
 
@@ -388,7 +388,7 @@ pub enum TensorOp {
     },
     BroadcastReduce {
         input: ValueId,
-        target_shape: Vec<usize>,
+        target_shape: Vec<u64>,
     },
     Matmul {
         lhs: ValueId,
@@ -396,7 +396,7 @@ pub enum TensorOp {
     },
     Transpose {
         input: ValueId,
-        perm: Vec<usize>,
+        perm: Vec<u64>,
     },
 }
 
@@ -533,7 +533,7 @@ impl<'en> en::IntoStream<'en> for BinaryOpArgs {
 
 struct ReduceOpArgs {
     input: ValueId,
-    target_shape: Vec<usize>,
+    target_shape: Vec<u64>,
 }
 
 impl de::FromStream for ReduceOpArgs {
@@ -604,7 +604,7 @@ impl<'en> en::IntoStream<'en> for ReduceOpArgs {
 
 struct TransposeOpArgs {
     input: ValueId,
-    perm: Vec<usize>,
+    perm: Vec<u64>,
 }
 
 impl de::FromStream for TransposeOpArgs {
@@ -990,9 +990,9 @@ fn shape_err(msg: impl Into<String>) -> ShapeError {
 /// Returns an error if the shapes are incompatible (a non-1 dimension paired with a
 /// different non-1 dimension).
 pub fn broadcast_shapes(
-    a: &[Option<usize>],
-    b: &[Option<usize>],
-) -> Result<Vec<Option<usize>>, ShapeError> {
+    a: &[Option<u64>],
+    b: &[Option<u64>],
+) -> Result<Vec<Option<u64>>, ShapeError> {
     let rank = a.len().max(b.len());
     let mut result = Vec::with_capacity(rank);
 
@@ -1032,8 +1032,8 @@ pub fn broadcast_shapes(
 /// Returns the list of reduction axis indices in ascending order (indexing into
 /// `input_shape`).
 pub fn broadcast_reduce_axes(
-    input_shape: &[usize],
-    target_shape: &[usize],
+    input_shape: &[u64],
+    target_shape: &[u64],
 ) -> Result<Vec<usize>, ShapeError> {
     let in_rank = input_shape.len();
     let tgt_rank = target_shape.len();
@@ -1056,7 +1056,7 @@ pub fn broadcast_reduce_axes(
             let inp = input_shape[i];
 
             if t == inp {
-            } else if t == 1 {
+            } else if t == 1u64 {
                 axes.push(i);
             } else {
                 return Err(shape_err(format!(
@@ -1078,9 +1078,9 @@ pub fn broadcast_reduce_axes(
 ///
 /// Dynamic (`None`) dimensions are propagated without error.
 pub fn matmul_shape(
-    a: &[Option<usize>],
-    b: &[Option<usize>],
-) -> Result<Vec<Option<usize>>, ShapeError> {
+    a: &[Option<u64>],
+    b: &[Option<u64>],
+) -> Result<Vec<Option<u64>>, ShapeError> {
     if a.len() < 2 {
         return Err(shape_err(format!(
             "matmul requires rank ≥ 2 for lhs, got rank {}",
@@ -1120,7 +1120,7 @@ pub fn matmul_shape(
 ///
 /// A valid permutation has exactly `rank` elements and each axis index in `[0, rank)`
 /// appears exactly once.
-pub fn validate_perm(perm: &[usize], rank: usize) -> Result<(), ShapeError> {
+pub fn validate_perm(perm: &[u64], rank: usize) -> Result<(), ShapeError> {
     if perm.len() != rank {
         return Err(shape_err(format!(
             "permutation length {} does not match tensor rank {}",
@@ -1132,19 +1132,19 @@ pub fn validate_perm(perm: &[usize], rank: usize) -> Result<(), ShapeError> {
     let mut seen = vec![false; rank];
 
     for &axis in perm {
-        if axis >= rank {
+        if axis >= rank as u64 {
             return Err(shape_err(format!(
                 "permutation axis {axis} out of range for rank {rank}"
             )));
         }
 
-        if seen[axis] {
+        if seen[axis as usize] {
             return Err(shape_err(format!(
                 "axis {axis} appears more than once in permutation"
             )));
         }
 
-        seen[axis] = true;
+        seen[axis as usize] = true;
     }
 
     Ok(())

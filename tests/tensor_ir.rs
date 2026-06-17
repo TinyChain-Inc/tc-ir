@@ -247,43 +247,43 @@ fn broadcast_scalar_with_vector() {
 
 #[test]
 fn reduce_axes_leading_dims() {
-    let input = vec![3usize, 4];
-    let target = vec![1usize, 4];
+    let input = vec![3u64, 4];
+    let target = vec![1u64, 4];
     assert_eq!(broadcast_reduce_axes(&input, &target).unwrap(), vec![0]);
 }
 
 #[test]
 fn reduce_axes_inner_dim_one() {
-    let input = vec![3usize, 4];
-    let target = vec![3usize, 1];
+    let input = vec![3u64, 4];
+    let target = vec![3u64, 1];
     assert_eq!(broadcast_reduce_axes(&input, &target).unwrap(), vec![1]);
 }
 
 #[test]
 fn reduce_axes_missing_leading() {
-    let input = vec![3usize, 4];
-    let target = vec![4usize];
+    let input = vec![3u64, 4];
+    let target = vec![4u64];
     assert_eq!(broadcast_reduce_axes(&input, &target).unwrap(), vec![0]);
 }
 
 #[test]
 fn reduce_axes_no_reduction_needed() {
-    let input = vec![3usize, 4];
-    let target = vec![3usize, 4];
+    let input = vec![3u64, 4];
+    let target = vec![3u64, 4];
     assert_eq!(broadcast_reduce_axes(&input, &target).unwrap(), vec![]);
 }
 
 #[test]
 fn reduce_axes_incompatible_target() {
-    let input = vec![3usize, 4];
-    let target = vec![3usize, 5];
+    let input = vec![3u64, 4];
+    let target = vec![3u64, 5];
     assert!(broadcast_reduce_axes(&input, &target).is_err());
 }
 
 #[test]
 fn reduce_axes_target_rank_exceeds_input_rank() {
-    let input = vec![4usize];
-    let target = vec![3usize, 4];
+    let input = vec![4u64];
+    let target = vec![3u64, 4];
     assert!(broadcast_reduce_axes(&input, &target).is_err());
 }
 
