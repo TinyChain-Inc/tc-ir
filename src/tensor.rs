@@ -285,7 +285,14 @@ impl<'en> en::IntoStream<'en> for UsizeSeq {
 
 // ====== TensorTypeSpec ======
 
-/// Element type and shape of a tensor value. Dynamic dimensions are represented as `None`.
+/// Element type and shape of a tensor value as described in the computation graph wire protocol.
+/// Dynamic dimensions are represented as `None` (e.g. an unknown batch size).
+///
+/// This is a **graph-construction-time** type: it describes what a graph node produces before any
+/// storage is involved. It is intentionally distinct from storage-layer schemas (such as
+/// `TensorStorageSchema` in the client layer) which require concrete positive dimensions and carry
+/// layout information (dense/sparse). A single shared type would force a compromise on one side:
+/// storage schemas cannot represent dynamic dimensions, and this type carries no layout metadata.
 ///
 /// Wire format: `{"dtype": "f32", "shape": [null, 3, 4]}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
