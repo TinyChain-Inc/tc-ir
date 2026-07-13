@@ -7,7 +7,6 @@
 
 use std::{future::Future, pin::Pin, str::FromStr};
 
-use futures::executor::block_on;
 use pathlink::Link;
 use tc_error::TCResult;
 use tc_ir::{
@@ -56,11 +55,12 @@ impl HandleGet<ExampleTxn> for HelloHandler {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn main() -> TCResult<()> {
-    run_example()
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> TCResult<()> {
+    run_example().await
 }
 
-pub fn run_example() -> TCResult<()> {
+pub async fn run_example() -> TCResult<()> {
     // This schema would typically match the manifest you publish via `/lib`.
     let schema = LibrarySchema::new(
         Link::from_str("/lib/examples/hello").expect("example link"),
@@ -87,7 +87,7 @@ pub fn run_example() -> TCResult<()> {
 
     // Dispatch the GET handler with a simple request body.
     let fut = handler.get(&txn, "TinyChain".to_string())?;
-    let greeting = block_on(fut)?;
+    let greeting = fut.await?;
     println!("{greeting}");
 
     Ok(())

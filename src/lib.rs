@@ -83,19 +83,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn handler_invocation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handler_invocation() {
         let handler = HelloHandler;
         let claim = Claim::new(Link::from_str("/hello").unwrap(), umask::Mode::all());
         let txn = FakeTxn::new(claim);
 
         let fut = handler.get(&txn, "world".into()).expect("GET supported");
-        let out = futures::executor::block_on(fut).unwrap();
+        let out = fut.await.unwrap();
         assert_eq!(out, "hello world");
     }
 
-    #[test]
-    fn library_schema_destream_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn library_schema_destream_roundtrip() {
         let schema = LibrarySchema::new(
             Link::from_str("/lib/service").expect("link"),
             "0.1.0",
@@ -106,15 +106,15 @@ mod tests {
         );
 
         let encoded = destream_json::encode(schema.clone()).expect("encode schema");
-        let decoded: LibrarySchema =
-            futures::executor::block_on(destream_json::try_decode((), encoded))
-                .expect("decode schema");
+        let decoded: LibrarySchema = destream_json::try_decode((), encoded)
+            .await
+            .expect("decode schema");
 
         assert_eq!(decoded, schema);
     }
 
-    #[test]
-    fn txn_header_destream_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn txn_header_destream_roundtrip() {
         let claim = Claim::new(Link::from_str("/lib/service").unwrap(), umask::Mode::all());
         let header = TxnHeader::new(
             TxnId::from_parts(NetworkTime::from_nanos(7), 1),
@@ -123,9 +123,9 @@ mod tests {
         );
 
         let encoded = destream_json::encode(header.clone()).expect("encode header");
-        let decoded: TxnHeader =
-            futures::executor::block_on(destream_json::try_decode((), encoded))
-                .expect("decode header");
+        let decoded: TxnHeader = destream_json::try_decode((), encoded)
+            .await
+            .expect("decode header");
 
         assert_eq!(decoded, header);
     }
@@ -147,8 +147,8 @@ mod tests {
         PathSegment::from_str(name).expect("path segment")
     }
 
-    #[test]
-    fn dir_routes_nested_handler() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dir_routes_nested_handler() {
         let path = vec![segment("library"), segment("status")];
         let dir = Dir::from_routes(vec![(path.clone(), HelloHandler)]).expect("dir");
 
@@ -157,7 +157,7 @@ mod tests {
 
         let handler = dir.route(&path).expect("handler resolved");
         let fut = handler.get(&txn, "tinychain".into()).expect("GET");
-        let out = futures::executor::block_on(fut).unwrap();
+        let out = fut.await.unwrap();
         assert_eq!(out, "hello tinychain");
     }
 
@@ -174,8 +174,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn macro_builds_routes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn macro_builds_routes() {
         let dir = tc_library_routes! {
             "/lib/status" => HelloHandler,
         }
@@ -186,12 +186,12 @@ mod tests {
         let path = [segment("lib"), segment("status")];
         let handler = dir.route(&path).expect("handler");
         let fut = handler.get(&txn, "macro".into()).expect("GET");
-        let out = futures::executor::block_on(fut).unwrap();
+        let out = fut.await.unwrap();
         assert_eq!(out, "hello macro");
     }
 
-    #[test]
-    fn scalar_map_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scalar_map_roundtrip() {
         let mut inner = Map::new();
         inner.insert(
             "signed".parse().expect("Id"),
@@ -209,38 +209,41 @@ mod tests {
         let scalar = Scalar::Map(outer);
 
         let encoded = destream_json::encode(scalar.clone()).expect("encode scalar map");
-        let decoded: Scalar = futures::executor::block_on(destream_json::try_decode((), encoded))
+        let decoded: Scalar = destream_json::try_decode((), encoded)
+            .await
             .expect("decode scalar map");
 
         assert_eq!(decoded, scalar);
     }
 
-    #[test]
-    fn scalar_tuple_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scalar_tuple_roundtrip() {
         let scalar = Scalar::Tuple(vec![Scalar::from(7_u64), Scalar::from(Value::from("x"))]);
 
         let encoded = destream_json::encode(scalar.clone()).expect("encode scalar tuple");
-        let decoded: Scalar = futures::executor::block_on(destream_json::try_decode((), encoded))
+        let decoded: Scalar = destream_json::try_decode((), encoded)
+            .await
             .expect("decode scalar tuple");
 
         assert_eq!(decoded, scalar);
     }
 
-    #[test]
-    fn scalar_opref_decodes_as_ref() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scalar_opref_decodes_as_ref() {
         let link = Link::from_str("/lib/acme/foo/1.0.0").expect("link");
         let op = OpRef::Get((Subject::Link(link), Scalar::default()));
         let scalar = Scalar::from(TCRef::Op(op));
 
         let encoded = destream_json::encode(scalar.clone()).expect("encode scalar ref");
-        let decoded: Scalar = futures::executor::block_on(destream_json::try_decode((), encoded))
+        let decoded: Scalar = destream_json::try_decode((), encoded)
+            .await
             .expect("decode scalar ref");
 
         assert_eq!(decoded, scalar);
     }
 
-    #[test]
-    fn scalar_typed_opref_get_key_decodes_as_ref() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scalar_typed_opref_get_key_decodes_as_ref() {
         let subject = Subject::Link(Link::from_str("/lib/acme/foo/1.0.0").expect("link"));
         let key = Scalar::from(Value::from("k"));
         let mut encoded_map = BTreeMap::new();
@@ -250,14 +253,15 @@ mod tests {
         );
 
         let encoded = destream_json::encode(encoded_map).expect("encode typed opref get");
-        let decoded: Scalar = futures::executor::block_on(destream_json::try_decode((), encoded))
+        let decoded: Scalar = destream_json::try_decode((), encoded)
+            .await
             .expect("decode typed opref get as scalar");
 
         assert_eq!(decoded, Scalar::from(TCRef::Op(OpRef::Get((subject, key)))));
     }
 
-    #[test]
-    fn opdef_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opdef_roundtrip() {
         let form = vec![
             ("x".parse().expect("Id"), Scalar::from(7_u64)),
             ("y".parse().expect("Id"), Scalar::from(Value::from("z"))),
@@ -265,35 +269,38 @@ mod tests {
         let op = OpDef::Post(form);
 
         let encoded = destream_json::encode(op.clone()).expect("encode opdef");
-        let decoded: OpDef = futures::executor::block_on(destream_json::try_decode((), encoded))
+        let decoded: OpDef = destream_json::try_decode((), encoded)
+            .await
             .expect("decode opdef");
 
         assert_eq!(decoded, op);
     }
 
-    #[test]
-    fn tcref_id_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcref_id_roundtrip() {
         let tcref = TCRef::Id("$foo".parse().expect("IdRef"));
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref id");
-        let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
+        let decoded: TCRef = destream_json::try_decode((), encoded)
+            .await
             .expect("decode tcref id");
         assert_eq!(decoded, tcref);
     }
 
-    #[test]
-    fn tcref_while_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcref_while_roundtrip() {
         let cond = Scalar::from(1_u64);
         let closure = Scalar::from(Value::from("step"));
         let state = Scalar::from(7_u64);
         let tcref = TCRef::While(Box::new(While::new(cond, closure, state)));
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref while");
-        let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
+        let decoded: TCRef = destream_json::try_decode((), encoded)
+            .await
             .expect("decode tcref while");
         assert_eq!(decoded, tcref);
     }
 
-    #[test]
-    fn tcref_if_decodes_to_cond() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcref_if_decodes_to_cond() {
         let cond = TCRef::Id("$flag".parse().expect("IdRef"));
         let then = Scalar::from(Value::from("yes"));
         let or_else = Scalar::from(Value::from("no"));
@@ -302,7 +309,8 @@ mod tests {
             vec![Scalar::from(cond.clone()), then.clone(), or_else.clone()],
         )]))
         .expect("encode legacy if map");
-        let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
+        let decoded: TCRef = destream_json::try_decode((), encoded)
+            .await
             .expect("decode tcref if");
         assert_eq!(
             decoded,
@@ -310,8 +318,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tcref_cond_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcref_cond_roundtrip() {
         let cond = TCRef::Id("$flag".parse().expect("IdRef"));
         let then = Scalar::Op(OpDef::Post(vec![(
             "result".parse().expect("Id"),
@@ -324,14 +332,15 @@ mod tests {
         let tcref = TCRef::Cond(Box::new(Cond::new(cond, then, or_else)));
 
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref cond");
-        let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
+        let decoded: TCRef = destream_json::try_decode((), encoded)
+            .await
             .expect("decode tcref cond");
 
         assert_eq!(decoded, tcref);
     }
 
-    #[test]
-    fn tcref_for_each_roundtrip() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcref_for_each_roundtrip() {
         let items = Scalar::Tuple(vec![Scalar::from(1_u64), Scalar::from(2_u64)]);
         let op = Scalar::Op(OpDef::Post(vec![(
             "result".parse().expect("Id"),
@@ -341,7 +350,8 @@ mod tests {
         let tcref = TCRef::ForEach(Box::new(ForEach::new(items, op, item_name)));
 
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref for_each");
-        let decoded: TCRef = futures::executor::block_on(destream_json::try_decode((), encoded))
+        let decoded: TCRef = destream_json::try_decode((), encoded)
+            .await
             .expect("decode tcref for_each");
 
         assert_eq!(decoded, tcref);

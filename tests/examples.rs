@@ -5,7 +5,9 @@ mod hello_example {
     ));
 }
 
-#[test]
-fn hello_example_runs() {
-    hello_example::run_example().expect("hello example should run");
+#[tokio::test(flavor = "multi_thread")]
+async fn hello_example_runs() {
+    hello_example::run_example()
+        .await
+        .expect("hello example should run");
 }

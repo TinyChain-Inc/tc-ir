@@ -132,6 +132,21 @@ pub trait Transaction: Send + Sync {
     fn claim(&self) -> &Claim;
 }
 
+/// Transaction lifecycle callbacks.
+pub trait Transact: Send + Sync {
+    /// A guard which can serialize or gate concurrent commits.
+    type Commit: Send + Sync;
+
+    /// Commit this transaction's pending changes.
+    fn commit(&self, txn_id: TxnId) -> impl std::future::Future<Output = Self::Commit> + Send;
+
+    /// Roll back this transaction's pending changes.
+    fn rollback(&self, txn_id: &TxnId) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Finalize transaction history at the given frontier.
+    fn finalize(&self, txn_id: &TxnId) -> impl std::future::Future<Output = ()> + Send;
+}
+
 /// Serializable header that conveys transaction context across process or WASM boundaries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxnHeader {
