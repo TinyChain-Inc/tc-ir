@@ -10,6 +10,7 @@ pyo3-conversions = ["dep:pyo3"]
 [dependencies]
 destream = { path = "../deps/destream", version = "0.10" }
 hr-id = { path = "../deps/hr-id", version = "0.7", features = ["stream"] }
+safecast = "0.2"
 serde = { version = "1", features = ["derive"] }
 umask = "2.1"
 pathlink = { path = "../deps/pathlink", features = ["stream"] }

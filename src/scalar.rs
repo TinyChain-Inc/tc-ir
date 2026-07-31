@@ -441,3 +441,49 @@ impl<'a> Iterator for ScalarWalk<'a> {
         Some(next)
     }
 }
+
+impl safecast::TryCastFrom<Scalar> for Value {
+    fn can_cast_from(scalar: &Scalar) -> bool {
+        match scalar {
+            Scalar::Value(_) => true,
+            Scalar::Tuple(items) => items.iter().all(Self::can_cast_from),
+            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) => false,
+        }
+    }
+
+    fn opt_cast_from(scalar: Scalar) -> Option<Self> {
+        match scalar {
+            Scalar::Value(value) => Some(value),
+            Scalar::Tuple(items) => {
+                let values = items
+                    .into_iter()
+                    .map(Self::opt_cast_from)
+                    .collect::<Option<Vec<_>>>()?;
+                Some(Value::Tuple(values))
+            }
+            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) => None,
+        }
+    }
+}
+
+impl safecast::TryCastFrom<Scalar> for Map<Value> {
+    fn can_cast_from(scalar: &Scalar) -> bool {
+        match scalar {
+            Scalar::Map(map) => map.values().all(Value::can_cast_from),
+            _ => false,
+        }
+    }
+
+    fn opt_cast_from(scalar: Scalar) -> Option<Self> {
+        match scalar {
+            Scalar::Map(map) => {
+                let mut out = Map::new();
+                for (id, scalar) in map.into_inner() {
+                    out.insert(id, Value::opt_cast_from(scalar)?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+}
