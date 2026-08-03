@@ -340,6 +340,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn tcref_after_roundtrip() {
+        let when = Scalar::from(TCRef::Id("$write".parse().expect("IdRef")));
+        let then = Scalar::from(TCRef::Id("$read".parse().expect("IdRef")));
+        let tcref = TCRef::After(Box::new(After::new(when, then)));
+
+        let encoded = destream_json::encode(tcref.clone()).expect("encode tcref after");
+        let decoded: TCRef = destream_json::try_decode((), encoded)
+            .await
+            .expect("decode tcref after");
+
+        assert_eq!(decoded, tcref);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn tcref_for_each_roundtrip() {
         let items = Scalar::Tuple(vec![Scalar::from(1_u64), Scalar::from(2_u64)]);
         let op = Scalar::Op(OpDef::Post(vec![(

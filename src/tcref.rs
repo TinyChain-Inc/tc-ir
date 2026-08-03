@@ -8,9 +8,7 @@ use tc_value::Value;
 
 /// A reference to a scalar value.
 ///
-/// v2 currently supports op references (`TCRef::Op`), scope IDs (`TCRef::Id`), and basic flow
-/// control (`TCRef::While`). Additional control-flow references (`If`, `Case`, etc.) will follow
-/// once the kernel has a complete ref scheduler.
+/// v2 supports op references (`TCRef::Op`), scope IDs (`TCRef::Id`), and flow control.
 ///
 /// ## v1-compatible JSON semantics
 ///
@@ -21,6 +19,7 @@ pub enum TCRef {
     Op(crate::op::OpRef),
     Id(IdRef),
     Cond(Box<Cond>),
+    After(Box<After>),
     While(Box<While>),
     ForEach(Box<ForEach>),
 }
@@ -40,6 +39,19 @@ impl Cond {
             then,
             or_else,
         }
+    }
+}
+
+/// Resolve `when` before resolving and returning `then`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct After {
+    pub when: Scalar,
+    pub then: Scalar,
+}
+
+impl After {
+    pub fn new(when: Scalar, then: Scalar) -> Self {
+        Self { when, then }
     }
 }
 
@@ -118,6 +130,7 @@ impl<'en> en::IntoStream<'en> for TCRef {
             TCRef::Op(op) => op.into_stream(encoder),
             TCRef::Id(id_ref) => encode_id_ref(id_ref, encoder),
             TCRef::Cond(cond) => encode_cond(*cond, encoder),
+            TCRef::After(after) => encode_after(*after, encoder),
             TCRef::While(while_ref) => encode_while_ref(*while_ref, encoder),
             TCRef::ForEach(for_each) => encode_for_each_ref(*for_each, encoder),
         }
@@ -193,6 +206,21 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
         }
 
         return Ok(TCRef::Cond(Box::new(Cond::new(cond, then, or_else))));
+    }
+
+    if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_AFTER)) {
+        let items = map.next_value::<Vec<Scalar>>(()).await?;
+        let mut iter = items.into_iter();
+        let (when, then) = match (iter.next(), iter.next(), iter.next()) {
+            (Some(when), Some(then), None) => (when, then),
+            _ => return Err(de::Error::custom("invalid After params (expected 2 elements)")),
+        };
+
+        while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+            let _ = map.next_value::<de::IgnoredAny>(()).await?;
+        }
+
+        return Ok(TCRef::After(Box::new(After::new(when, then))));
     }
 
     if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_WHILE)) {
@@ -303,6 +331,18 @@ fn encode_cond<'en, E: en::Encoder<'en>>(cond: Cond, encoder: E) -> Result<E::Ok
         cond.then,
         cond.or_else,
     ]))?;
+    map.end()
+}
+
+fn encode_after<'en, E: en::Encoder<'en>>(
+    after: After,
+    encoder: E,
+) -> Result<E::Ok, E::Error> {
+    use destream::en::EncodeMap;
+
+    let mut map = encoder.encode_map(Some(1))?;
+    map.encode_key(PathBuf::from(crate::TCREF_AFTER).to_string())?;
+    map.encode_value(ScalarSeq::new(vec![after.when, after.then]))?;
     map.end()
 }
 
