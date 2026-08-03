@@ -99,6 +99,7 @@ pub const OPREF_POST: PathLabel = path_label(&["state", "scalar", "ref", "op", "
 pub const OPREF_DELETE: PathLabel = path_label(&["state", "scalar", "ref", "op", "delete"]);
 pub const TCREF_IF: PathLabel = path_label(&["state", "scalar", "ref", "if"]);
 pub const TCREF_COND: PathLabel = path_label(&["state", "scalar", "ref", "cond"]);
+pub const TCREF_AFTER: PathLabel = path_label(&["state", "scalar", "ref", "after"]);
 pub const TCREF_WHILE: PathLabel = path_label(&["state", "scalar", "ref", "while"]);
 pub const TCREF_FOR_EACH: PathLabel = path_label(&["state", "scalar", "ref", "for_each"]);
 pub const OPDEF_GET: PathLabel = path_label(&["state", "scalar", "op", "get"]);
@@ -338,6 +339,7 @@ impl<'en> en::ToStream<'en> for Scalar {
 fn is_tcref_or_opref_path(path: &PathBuf) -> bool {
     path == &PathBuf::from(TCREF_IF)
         || path == &PathBuf::from(TCREF_COND)
+        || path == &PathBuf::from(TCREF_AFTER)
         || path == &PathBuf::from(TCREF_WHILE)
         || path == &PathBuf::from(TCREF_FOR_EACH)
         || path == &PathBuf::from(OPREF_GET)
