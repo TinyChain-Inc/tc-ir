@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use destream::{de, en, EncodeMap, IntoStream};
 use pathlink::Link;
 
-use crate::{Route, StateInstance};
+use crate::StateInstance;
 
 /// Static description of a TinyChain library exposed through `/lib`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,7 +133,6 @@ pub struct LibraryModule<State, Routes> {
 impl<State, Routes> LibraryModule<State, Routes>
 where
     State: StateInstance,
-    Routes: Route<State>,
 {
     /// Construct a new [`LibraryModule`].
     pub fn new(schema: LibrarySchema, routes: Routes) -> Self {
@@ -148,7 +147,6 @@ where
 impl<State, Routes> Library for LibraryModule<State, Routes>
 where
     State: StateInstance,
-    Routes: Route<State>,
 {
     type State = State;
     type Routes = Routes;
@@ -165,7 +163,7 @@ where
 /// Trait implemented by every TinyChain library, whether native or WASM-backed.
 pub trait Library {
     type State: StateInstance;
-    type Routes: Route<Self::State>;
+    type Routes;
 
     /// Schema returned by `/lib`.
     fn schema(&self) -> &LibrarySchema;

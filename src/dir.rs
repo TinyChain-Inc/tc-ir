@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt, str::FromStr};
 use pathlink::{Path, PathSegment};
 use tc_error::{TCError, TCResult};
 
-use crate::Route;
+use crate::{Handler, Route, StateInstance};
 
 /// Directory-style router inspired by TinyChain's transactional `Dir`.
 #[derive(Default)]
@@ -124,11 +124,14 @@ impl<H: Clone> Dir<H> {
     }
 }
 
-impl<State, H: Clone + Send + Sync> Route<State> for Dir<H> {
-    type Handler = H;
-
-    fn route(&self, path: &[PathSegment]) -> Option<Self::Handler> {
+impl<State, H> Route<State> for Dir<H>
+where
+    State: StateInstance,
+    H: Clone + Handler<State> + 'static,
+{
+    fn route(&self, path: &[PathSegment]) -> Option<Box<dyn Handler<State> + '_>> {
         self.route(path)
+            .map(|handler| Box::new(handler) as Box<dyn Handler<State>>)
     }
 }
 

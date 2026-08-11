@@ -1,5 +1,6 @@
 use std::future::Future;
 
+use async_trait::async_trait;
 use pathlink::PathSegment;
 use tc_error::{TCError, TCResult};
 
@@ -32,11 +33,9 @@ impl std::fmt::Display for Method {
 }
 
 /// IR analogue of `tc-transact`'s `Route` trait.
-pub trait Route<State>: Send + Sync {
-    type Handler;
-
+pub trait Route<State: StateInstance>: Send + Sync {
     /// Resolve the handler mounted at the given path.
-    fn route(&self, path: &[PathSegment]) -> Option<Self::Handler>;
+    fn route(&self, path: &[PathSegment]) -> Option<Box<dyn Handler<State> + '_>>;
 }
 
 /// The minimal native state capability required by routing.
@@ -46,61 +45,37 @@ pub trait StateInstance: Clone + Send + 'static {
 
 /// A native route handler. Methods exchange state directly and know nothing
 /// about views, serialization, or transport representations.
+#[async_trait]
 pub trait Handler<State>: Send + Sync
 where
     State: StateInstance,
 {
-    fn get(
-        &self,
-        _txn: &State::Transaction,
-        _key: Scalar,
-    ) -> impl Future<Output = TCResult<State>> + Send {
-        async {
-            Err(TCError::method_not_allowed(
-                Method::Get,
-                std::any::type_name::<Self>(),
-            ))
-        }
+    async fn get(&self, _txn: &State::Transaction, _key: Scalar) -> TCResult<State> {
+        Err(TCError::method_not_allowed(
+            Method::Get,
+            std::any::type_name::<Self>(),
+        ))
     }
 
-    fn put(
-        &self,
-        _txn: &State::Transaction,
-        _key: Scalar,
-        _value: State,
-    ) -> impl Future<Output = TCResult<()>> + Send {
-        async {
-            Err(TCError::method_not_allowed(
-                Method::Put,
-                std::any::type_name::<Self>(),
-            ))
-        }
+    async fn put(&self, _txn: &State::Transaction, _key: Scalar, _value: State) -> TCResult<()> {
+        Err(TCError::method_not_allowed(
+            Method::Put,
+            std::any::type_name::<Self>(),
+        ))
     }
 
-    fn post(
-        &self,
-        _txn: &State::Transaction,
-        _params: Map<State>,
-    ) -> impl Future<Output = TCResult<State>> + Send {
-        async {
-            Err(TCError::method_not_allowed(
-                Method::Post,
-                std::any::type_name::<Self>(),
-            ))
-        }
+    async fn post(&self, _txn: &State::Transaction, _params: Map<State>) -> TCResult<State> {
+        Err(TCError::method_not_allowed(
+            Method::Post,
+            std::any::type_name::<Self>(),
+        ))
     }
 
-    fn delete(
-        &self,
-        _txn: &State::Transaction,
-        _key: Scalar,
-    ) -> impl Future<Output = TCResult<()>> + Send {
-        async {
-            Err(TCError::method_not_allowed(
-                Method::Delete,
-                std::any::type_name::<Self>(),
-            ))
-        }
+    async fn delete(&self, _txn: &State::Transaction, _key: Scalar) -> TCResult<()> {
+        Err(TCError::method_not_allowed(
+            Method::Delete,
+            std::any::type_name::<Self>(),
+        ))
     }
 }
 
@@ -108,7 +83,6 @@ where
 pub trait Public<State>: Route<State>
 where
     State: StateInstance,
-    Self::Handler: Handler<State>,
 {
     fn get(
         &self,
@@ -172,7 +146,6 @@ impl<State, T> Public<State> for T
 where
     State: StateInstance,
     T: Route<State>,
-    T::Handler: Handler<State>,
 {
 }
 

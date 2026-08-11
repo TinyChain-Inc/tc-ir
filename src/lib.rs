@@ -16,6 +16,7 @@ mod txn;
 pub use txn::*;
 
 mod handler;
+pub use async_trait::async_trait;
 pub use handler::*;
 
 mod view;
@@ -86,6 +87,7 @@ mod tests {
         type Transaction = FakeTxn;
     }
 
+    #[async_trait::async_trait]
     impl Handler<FakeState> for HelloHandler {
         async fn get(&self, _txn: &FakeTxn, request: Scalar) -> TCResult<FakeState> {
             let Scalar::Value(Value::String(request)) = request else {
@@ -172,10 +174,11 @@ mod tests {
     fn native_route_state_is_explicit() {
         let handler = include_str!("handler.rs");
         assert!(!handler.contains("Route<State ="));
+        assert!(!handler.contains("type Handler"));
+        assert!(handler.contains("Box<dyn Handler<State>"));
 
         let library = include_str!("library.rs");
-        assert!(library.contains("Routes: Route<State>"));
-        assert!(!library.contains("Routes: Route,"));
+        assert!(!library.contains("Routes: Route"));
     }
 
     #[test]
