@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use destream::{de, en, EncodeMap, IntoStream};
 use pathlink::Link;
 
-use crate::{Route, Transaction};
+use crate::{Route, StateInstance};
 
 /// Static description of a TinyChain library exposed through `/lib`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,33 +124,33 @@ impl<'en> en::ToStream<'en> for LibrarySchema {
 }
 
 /// Convenience wrapper that pairs a schema with a reusable routing table.
-pub struct LibraryModule<Txn: ?Sized, Routes> {
+pub struct LibraryModule<State, Routes> {
     schema: LibrarySchema,
     routes: Routes,
-    _txn: PhantomData<Txn>,
+    state: PhantomData<fn() -> State>,
 }
 
-impl<Txn: ?Sized, Routes> LibraryModule<Txn, Routes>
+impl<State, Routes> LibraryModule<State, Routes>
 where
-    Txn: Transaction,
-    Routes: Route,
+    State: StateInstance,
+    Routes: Route<State>,
 {
     /// Construct a new [`LibraryModule`].
     pub fn new(schema: LibrarySchema, routes: Routes) -> Self {
         Self {
             schema,
             routes,
-            _txn: PhantomData,
+            state: PhantomData,
         }
     }
 }
 
-impl<Txn: ?Sized, Routes> Library for LibraryModule<Txn, Routes>
+impl<State, Routes> Library for LibraryModule<State, Routes>
 where
-    Txn: Transaction,
-    Routes: Route,
+    State: StateInstance,
+    Routes: Route<State>,
 {
-    type Txn = Txn;
+    type State = State;
     type Routes = Routes;
 
     fn schema(&self) -> &LibrarySchema {
@@ -164,8 +164,8 @@ where
 
 /// Trait implemented by every TinyChain library, whether native or WASM-backed.
 pub trait Library {
-    type Txn: Transaction + ?Sized;
-    type Routes: Route;
+    type State: StateInstance;
+    type Routes: Route<Self::State>;
 
     /// Schema returned by `/lib`.
     fn schema(&self) -> &LibrarySchema;

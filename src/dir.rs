@@ -115,11 +115,20 @@ impl<H> Dir<H> {
     }
 }
 
-impl<H: Clone + Send + Sync> Route for Dir<H> {
+impl<H: Clone> Dir<H> {
+    /// Resolve a handler without requiring a native state type.
+    ///
+    /// State becomes relevant only when the resolved handler is invoked.
+    pub fn route(&self, path: &[PathSegment]) -> Option<H> {
+        self.route_path(path).cloned()
+    }
+}
+
+impl<State, H: Clone + Send + Sync> Route<State> for Dir<H> {
     type Handler = H;
 
     fn route(&self, path: &[PathSegment]) -> Option<Self::Handler> {
-        self.route_path(path).cloned()
+        self.route(path)
     }
 }
 

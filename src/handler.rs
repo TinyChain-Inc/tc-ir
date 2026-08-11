@@ -32,7 +32,7 @@ impl std::fmt::Display for Method {
 }
 
 /// IR analogue of `tc-transact`'s `Route` trait.
-pub trait Route<State = ()>: Send + Sync {
+pub trait Route<State>: Send + Sync {
     type Handler;
 
     /// Resolve the handler mounted at the given path.

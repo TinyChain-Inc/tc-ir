@@ -169,6 +169,16 @@ mod tests {
     }
 
     #[test]
+    fn native_route_state_is_explicit() {
+        let handler = include_str!("handler.rs");
+        assert!(!handler.contains("Route<State ="));
+
+        let library = include_str!("library.rs");
+        assert!(library.contains("Routes: Route<State>"));
+        assert!(!library.contains("Routes: Route,"));
+    }
+
+    #[test]
     fn conditional_refs_have_one_wire_form() {
         let legacy_symbol = ["TCREF", "_IF"].concat();
         let legacy_path = ["/state/scalar/ref", "/if"].concat();
@@ -395,7 +405,7 @@ mod tests {
         }
         .expect("routes");
 
-        let lib: LibraryModule<FakeTxn, _> = LibraryModule::new(schema.clone(), routes);
+        let lib: LibraryModule<FakeState, _> = LibraryModule::new(schema.clone(), routes);
         assert_eq!(lib.schema(), &schema);
         let path = [segment("lib"), segment("status")];
         assert!(lib.routes().route(&path).is_some());

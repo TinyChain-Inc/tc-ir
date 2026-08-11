@@ -20,6 +20,9 @@ stable so other crates can depend on it without pulling in runtime-specific bagg
 - `Public<State>` is the one uniform verb dispatcher: it owns route lookup and
   method-not-allowed behavior, while resolved `Handler<State>` implementations
   receive only typed native requests and `State::Transaction`.
+- Native state is part of the route contract and must always be explicit. Define
+  `Route<State>`, `Handler<State>`, and library route tables with the canonical native
+  state type; never default `State` to `()` or infer it through a phantom transaction.
 - Do not add per-verb traits with associated request, response, error, or future
   types. `Handler<State>` is the sole native verb contract; boundary ABIs may
   define their own explicitly boundary-local call interfaces.
