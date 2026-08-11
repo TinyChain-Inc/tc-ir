@@ -1,9 +1,13 @@
-//! Core TinyChain IR traits, inspired by `tc-transact`'s `Handler` and `Route` abstractions.
+#![forbid(unsafe_code)]
+
+//! Core TinyChain IR traits, inspired by `tc-transact`'s `Handler` and `Route`
+//! abstractions.
 //!
-//! These definitions intentionally mirror the behavior of the existing `tc-transact`
-//! `Handler`/`Route` traits while staying agnostic to any particular runtime. They should
-//! be expressive enough to back WASM sandboxes, PyO3 bindings, or the existing Rust
-//! server stack without leaking lower-level implementation details.
+//! These definitions intentionally mirror the behavior of the existing
+//! `tc-transact` `Handler`/`Route` traits while staying agnostic to any
+//! particular runtime. They should be expressive enough to back WASM sandboxes,
+//! PyO3 bindings, or the existing Rust server stack without leaking lower-level
+//! implementation details.
 
 pub use hr_id::Id;
 pub use tc_value::class::{Class, NativeClass};
@@ -13,6 +17,9 @@ pub use txn::*;
 
 mod handler;
 pub use handler::*;
+
+mod view;
+pub use view::*;
 
 mod map;
 pub use map::Map;
@@ -34,14 +41,15 @@ pub use library::*;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use std::{collections::BTreeMap, future::Future, pin::Pin, str::FromStr};
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
 
     use number_general::Number;
     use pathlink::{Link, PathBuf, PathSegment};
     use tc_error::TCResult;
     use tc_value::Value;
+
+    use super::*;
 
     #[derive(Clone)]
     struct FakeTxn {
@@ -68,18 +76,22 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct HelloHandler;
 
-    impl HandleGet<FakeTxn> for HelloHandler {
-        type Request = String;
-        type RequestContext = ();
-        type Response = String;
-        type Error = ();
-        type Fut<'a> =
-            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>;
+    #[derive(Clone)]
+    struct FakeState(String);
 
-        fn get<'a>(&'a self, _txn: &'a FakeTxn, request: Self::Request) -> TCResult<Self::Fut<'a>> {
-            Ok(Box::pin(async move { Ok(format!("hello {request}")) }))
+    impl StateInstance for FakeState {
+        type Transaction = FakeTxn;
+    }
+
+    impl Handler<FakeState> for HelloHandler {
+        async fn get(&self, _txn: &FakeTxn, request: Scalar) -> TCResult<FakeState> {
+            let Scalar::Value(Value::String(request)) = request else {
+                return Err(tc_error::TCError::bad_request("expected a string"));
+            };
+            Ok(FakeState(format!("hello {request}")))
         }
     }
 
@@ -89,9 +101,11 @@ mod tests {
         let claim = Claim::new(Link::from_str("/hello").unwrap(), umask::Mode::all());
         let txn = FakeTxn::new(claim);
 
-        let fut = handler.get(&txn, "world".into()).expect("GET supported");
-        let out = fut.await.unwrap();
-        assert_eq!(out, "hello world");
+        let out = handler
+            .get(&txn, Scalar::from(Value::String("world".into())))
+            .await
+            .unwrap();
+        assert_eq!(out.0, "hello world");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -116,11 +130,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn txn_header_destream_roundtrip() {
         let claim = Claim::new(Link::from_str("/lib/service").unwrap(), umask::Mode::all());
-        let header = TxnHeader::new(
-            TxnId::from_parts(NetworkTime::from_nanos(7), 1),
-            NetworkTime::from_nanos(7),
-            claim,
-        );
+        let header = TxnHeader::from_transaction(&FakeTxn::new(claim));
 
         let encoded = destream_json::encode(header.clone()).expect("encode header");
         let decoded: TxnHeader = destream_json::try_decode((), encoded)
@@ -147,6 +157,27 @@ mod tests {
         PathSegment::from_str(name).expect("path segment")
     }
 
+    #[test]
+    fn native_routing_is_projection_free() {
+        let routing = include_str!("handler.rs");
+        for forbidden in ["destream", "serde", "hyper", "pyo3", "wasm"] {
+            assert!(
+                !routing.contains(forbidden),
+                "native routing must not depend on {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_refs_have_one_wire_form() {
+        let legacy_symbol = ["TCREF", "_IF"].concat();
+        let legacy_path = ["/state/scalar/ref", "/if"].concat();
+        for source in [include_str!("scalar.rs"), include_str!("tcref.rs")] {
+            assert!(!source.contains(&legacy_symbol));
+            assert!(!source.contains(&legacy_path));
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn dir_routes_nested_handler() {
         let path = vec![segment("library"), segment("status")];
@@ -156,9 +187,11 @@ mod tests {
         let txn = FakeTxn::new(claim);
 
         let handler = dir.route(&path).expect("handler resolved");
-        let fut = handler.get(&txn, "tinychain".into()).expect("GET");
-        let out = fut.await.unwrap();
-        assert_eq!(out, "hello tinychain");
+        let out = handler
+            .get(&txn, Scalar::from(Value::String("tinychain".to_string())))
+            .await
+            .expect("GET");
+        assert_eq!(out.0, "hello tinychain");
     }
 
     #[test]
@@ -185,9 +218,11 @@ mod tests {
         let txn = FakeTxn::new(claim);
         let path = [segment("lib"), segment("status")];
         let handler = dir.route(&path).expect("handler");
-        let fut = handler.get(&txn, "macro".into()).expect("GET");
-        let out = fut.await.unwrap();
-        assert_eq!(out, "hello macro");
+        let out = handler
+            .get(&txn, Scalar::from(Value::String("macro".to_string())))
+            .await
+            .expect("GET");
+        assert_eq!(out.0, "hello macro");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -300,25 +335,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn tcref_if_decodes_to_cond() {
-        let cond = TCRef::Id("$flag".parse().expect("IdRef"));
-        let then = Scalar::from(Value::from("yes"));
-        let or_else = Scalar::from(Value::from("no"));
-        let encoded = destream_json::encode(std::collections::BTreeMap::from([(
-            PathBuf::from(TCREF_IF).to_string(),
-            vec![Scalar::from(cond.clone()), then.clone(), or_else.clone()],
-        )]))
-        .expect("encode legacy if map");
-        let decoded: TCRef = destream_json::try_decode((), encoded)
-            .await
-            .expect("decode tcref if");
-        assert_eq!(
-            decoded,
-            TCRef::Cond(Box::new(Cond::new(cond, then, or_else)))
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn tcref_cond_roundtrip() {
         let cond = TCRef::Id("$flag".parse().expect("IdRef"));
         let then = Scalar::Op(OpDef::Post(vec![(
@@ -372,14 +388,14 @@ mod tests {
     }
 
     #[test]
-    fn static_library_wraps_schema_and_routes() {
+    fn library_module_wraps_schema_and_routes() {
         let schema = LibrarySchema::new(Link::from_str("/lib/service").unwrap(), "1.0.0", vec![]);
         let routes = tc_library_routes! {
             "/lib/status" => HelloHandler,
         }
         .expect("routes");
 
-        let lib: StaticLibrary<FakeTxn, _> = StaticLibrary::new(schema.clone(), routes);
+        let lib: LibraryModule<FakeTxn, _> = LibraryModule::new(schema.clone(), routes);
         assert_eq!(lib.schema(), &schema);
         let path = [segment("lib"), segment("status")];
         assert!(lib.routes().route(&path).is_some());

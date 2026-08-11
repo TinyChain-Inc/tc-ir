@@ -105,7 +105,7 @@ impl<H> Dir<H> {
         }
     }
 
-    fn route_path<'a>(&'a self, path: &'a [PathSegment]) -> Option<&'a H> {
+    fn route_path(&self, path: &[PathSegment]) -> Option<&H> {
         let (head, tail) = path.split_first()?;
         match self.entries.get(head) {
             Some(DirEntry::Handler(handler)) if tail.is_empty() => Some(handler),
@@ -115,11 +115,11 @@ impl<H> Dir<H> {
     }
 }
 
-impl<H> Route for Dir<H> {
+impl<H: Clone + Send + Sync> Route for Dir<H> {
     type Handler = H;
 
-    fn route<'a>(&'a self, path: &'a [PathSegment]) -> Option<&'a Self::Handler> {
-        self.route_path(path)
+    fn route(&self, path: &[PathSegment]) -> Option<Self::Handler> {
+        self.route_path(path).cloned()
     }
 }
 

@@ -16,9 +16,9 @@ HTTP, PyO3, WASM, or future transports.
 - **Libraries and routes.** `LibrarySchema`, `LibraryModule`, `Dir`, and the
   `tc_library_routes!` macro make it easy to declare `/lib/...` manifests that
   compile once but run across adapters.
-- **Examples.** `examples/hello_library.rs` demonstrates how to build a native
-  library module and dispatch handlers without HTTP. WASM-facing examples live
-  under `tc-wasm/examples`.
+- **Library modules.** `LibrarySchema`, `LibraryModule`, and route helpers are
+  transport-neutral definitions; only a kernel-issued transaction context may
+  invoke their handlers.
 
 See `AGENTS.md` for design constraints (dependency hygiene, backward
 compatibility) and `IR_INTERFACE_GUIDELINES.md` for field-by-field documentation.
@@ -28,12 +28,10 @@ compatibility) and `IR_INTERFACE_GUIDELINES.md` for field-by-field documentation
 ```bash
 cargo build -p tc-ir
 cargo test  -p tc-ir
-cargo run   -p tc-ir --example hello_library
 ```
 
-Run the example to verify route registration and handler dispatch work as
-expected. When you touch serialization logic, add round-trip tests to catch
-regressions early.
+When you touch serialization logic, add round-trip tests to catch regressions
+early.
 
 ## Extending the IR
 

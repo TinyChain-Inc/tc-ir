@@ -3,10 +3,6 @@ name = "tc-ir"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = []
-pyo3-conversions = ["dep:pyo3"]
-
 [dependencies]
 destream = { path = "../deps/destream", version = "0.10" }
 hr-id = { path = "../deps/hr-id", version = "0.7", features = ["stream"] }
@@ -17,7 +13,6 @@ pathlink = { path = "../deps/pathlink", features = ["stream"] }
 tc-error = { path = "../tc-error" }
 tc-value = { path = "../tc-value" }
 number-general = { path = "../deps/number-general", version = "0.14", default-features = false, features = ["stream"] }
-pyo3 = { version = "0.21", optional = true }
 
 [dev-dependencies]
 destream_json = { path = "../deps/destream_json", version = "0.15", default-features = false }

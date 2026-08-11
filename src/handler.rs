@@ -1,12 +1,11 @@
 use std::future::Future;
 
-use destream::de;
 use pathlink::PathSegment;
 use tc_error::{TCError, TCResult};
 
-use crate::Transaction;
+use crate::{Map, Scalar, Transaction};
 
-/// HTTP-like verbs supported by TinyChain routers.
+/// Native verbs supported by TinyChain routers and projected by adapters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Method {
     Get,
@@ -15,98 +14,173 @@ pub enum Method {
     Delete,
 }
 
+impl Method {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Put => "PUT",
+            Self::Post => "POST",
+            Self::Delete => "DELETE",
+        }
+    }
+}
+
+impl std::fmt::Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// IR analogue of `tc-transact`'s `Route` trait.
-pub trait Route {
+pub trait Route<State = ()>: Send + Sync {
     type Handler;
 
     /// Resolve the handler mounted at the given path.
-    fn route<'a>(&'a self, path: &'a [PathSegment]) -> Option<&'a Self::Handler>;
+    fn route(&self, path: &[PathSegment]) -> Option<Self::Handler>;
 }
 
-/// Marker trait implemented by every TinyChain handler.
-pub trait Handler<T>: Send + Sync
+/// The minimal native state capability required by routing.
+pub trait StateInstance: Clone + Send + 'static {
+    type Transaction: Transaction;
+}
+
+/// A native route handler. Methods exchange state directly and know nothing
+/// about views, serialization, or transport representations.
+pub trait Handler<State>: Send + Sync
 where
-    T: Transaction + ?Sized,
+    State: StateInstance,
 {
-    fn method_not_supported(method: Method) -> TCError {
-        TCError::method_not_allowed(method, std::any::type_name::<Self>())
-    }
-}
-
-impl<T, H> Handler<T> for H
-where
-    T: Transaction + ?Sized,
-    H: Send + Sync,
-{
-}
-
-#[cfg(feature = "pyo3-conversions")]
-pub trait FromPyRequest<'py>: Sized {
-    type PyError;
-
-    fn from_py(obj: &pyo3::Bound<'py, pyo3::PyAny>) -> Result<Self, Self::PyError>;
-}
-
-/// Shared extraction trait for PyO3-native request/response paths.
-///
-/// This is the scalable replacement for per-type ad-hoc conversion impls. Runtime crates can
-/// implement these traits close to each type family (e.g. Value, Collection, State) and compose
-/// them through enum visitors rather than centralizing every concrete type in one adapter module.
-#[cfg(feature = "pyo3-conversions")]
-pub trait PyExtract<'py>: Sized {
-    type PyError;
-
-    fn py_extract(obj: &pyo3::Bound<'py, pyo3::PyAny>) -> Result<Self, Self::PyError>;
-}
-
-#[cfg(feature = "pyo3-conversions")]
-pub trait PyProject {
-    type PyError;
-
-    fn py_project(self, py: pyo3::Python<'_>) -> Result<pyo3::Py<pyo3::PyAny>, Self::PyError>;
-}
-
-#[cfg(feature = "pyo3-conversions")]
-impl<'py, T> FromPyRequest<'py> for T
-where
-    T: PyExtract<'py>,
-{
-    type PyError = T::PyError;
-
-    fn from_py(obj: &pyo3::Bound<'py, pyo3::PyAny>) -> Result<Self, Self::PyError> {
-        T::py_extract(obj)
-    }
-}
-
-macro_rules! define_verb_handler {
-    ($trait_name:ident, $fn_name:ident, $method:expr) => {
-        pub trait $trait_name<T>: Handler<T>
-        where
-            T: Transaction + ?Sized,
-        {
-            type Request: de::FromStream<Context = Self::RequestContext>;
-            type RequestContext: Send;
-            type Response;
-            type Error;
-            type Fut<'a>: Future<Output = Result<Self::Response, Self::Error>> + Send + 'a
-            where
-                Self: 'a,
-                T: 'a,
-                Self::Request: 'a;
-
-            fn $fn_name<'a>(
-                &'a self,
-                txn: &'a T,
-                request: Self::Request,
-            ) -> TCResult<Self::Fut<'a>> {
-                let _ = (txn, request);
-                Err(Self::method_not_supported($method))
-            }
+    fn get(
+        &self,
+        _txn: &State::Transaction,
+        _key: Scalar,
+    ) -> impl Future<Output = TCResult<State>> + Send {
+        async {
+            Err(TCError::method_not_allowed(
+                Method::Get,
+                std::any::type_name::<Self>(),
+            ))
         }
-    };
+    }
+
+    fn put(
+        &self,
+        _txn: &State::Transaction,
+        _key: Scalar,
+        _value: State,
+    ) -> impl Future<Output = TCResult<()>> + Send {
+        async {
+            Err(TCError::method_not_allowed(
+                Method::Put,
+                std::any::type_name::<Self>(),
+            ))
+        }
+    }
+
+    fn post(
+        &self,
+        _txn: &State::Transaction,
+        _params: Map<State>,
+    ) -> impl Future<Output = TCResult<State>> + Send {
+        async {
+            Err(TCError::method_not_allowed(
+                Method::Post,
+                std::any::type_name::<Self>(),
+            ))
+        }
+    }
+
+    fn delete(
+        &self,
+        _txn: &State::Transaction,
+        _key: Scalar,
+    ) -> impl Future<Output = TCResult<()>> + Send {
+        async {
+            Err(TCError::method_not_allowed(
+                Method::Delete,
+                std::any::type_name::<Self>(),
+            ))
+        }
+    }
 }
 
-define_verb_handler!(HandleGet, get, Method::Get);
-define_verb_handler!(HandlePut, put, Method::Put);
-define_verb_handler!(HandlePost, post, Method::Post);
-define_verb_handler!(HandleDelete, delete, Method::Delete);
+/// Uniform native method dispatch for every routed value.
+pub trait Public<State>: Route<State>
+where
+    State: StateInstance,
+    Self::Handler: Handler<State>,
+{
+    fn get(
+        &self,
+        txn: &State::Transaction,
+        path: &[PathSegment],
+        key: Scalar,
+    ) -> impl Future<Output = TCResult<State>> + Send {
+        async move {
+            self.route(path)
+                .ok_or_else(|| TCError::not_found(path_string(path)))?
+                .get(txn, key)
+                .await
+        }
+    }
+
+    fn put(
+        &self,
+        txn: &State::Transaction,
+        path: &[PathSegment],
+        key: Scalar,
+        value: State,
+    ) -> impl Future<Output = TCResult<()>> + Send {
+        async move {
+            self.route(path)
+                .ok_or_else(|| TCError::not_found(path_string(path)))?
+                .put(txn, key, value)
+                .await
+        }
+    }
+
+    fn post(
+        &self,
+        txn: &State::Transaction,
+        path: &[PathSegment],
+        params: Map<State>,
+    ) -> impl Future<Output = TCResult<State>> + Send {
+        async move {
+            self.route(path)
+                .ok_or_else(|| TCError::not_found(path_string(path)))?
+                .post(txn, params)
+                .await
+        }
+    }
+
+    fn delete(
+        &self,
+        txn: &State::Transaction,
+        path: &[PathSegment],
+        key: Scalar,
+    ) -> impl Future<Output = TCResult<()>> + Send {
+        async move {
+            self.route(path)
+                .ok_or_else(|| TCError::not_found(path_string(path)))?
+                .delete(txn, key)
+                .await
+        }
+    }
+}
+
+impl<State, T> Public<State> for T
+where
+    State: StateInstance,
+    T: Route<State>,
+    T::Handler: Handler<State>,
+{
+}
+
+fn path_string(path: &[PathSegment]) -> String {
+    let suffix = path
+        .iter()
+        .map(PathSegment::as_str)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("/{suffix}")
+}

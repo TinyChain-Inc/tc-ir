@@ -134,17 +134,23 @@ pub trait Transaction: Send + Sync {
 
 /// Transaction lifecycle callbacks.
 pub trait Transact: Send + Sync {
-    /// A guard which can serialize or gate concurrent commits.
-    type Commit: Send + Sync;
-
     /// Commit this transaction's pending changes.
-    fn commit(&self, txn_id: TxnId) -> impl std::future::Future<Output = Self::Commit> + Send;
+    fn commit(
+        &self,
+        txn_id: TxnId,
+    ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send;
 
     /// Roll back this transaction's pending changes.
-    fn rollback(&self, txn_id: &TxnId) -> impl std::future::Future<Output = ()> + Send;
+    fn rollback(
+        &self,
+        txn_id: &TxnId,
+    ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send;
 
     /// Finalize transaction history at the given frontier.
-    fn finalize(&self, txn_id: &TxnId) -> impl std::future::Future<Output = ()> + Send;
+    fn finalize(
+        &self,
+        txn_id: &TxnId,
+    ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send;
 }
 
 /// Serializable header that conveys transaction context across process or WASM boundaries.
@@ -156,7 +162,7 @@ pub struct TxnHeader {
 }
 
 impl TxnHeader {
-    pub fn new(id: TxnId, timestamp: NetworkTime, claim: Claim) -> Self {
+    fn new(id: TxnId, timestamp: NetworkTime, claim: Claim) -> Self {
         Self {
             id,
             timestamp,
@@ -177,6 +183,20 @@ impl TxnHeader {
     }
 
     pub fn claim(&self) -> &Claim {
+        &self.claim
+    }
+}
+
+impl Transaction for TxnHeader {
+    fn id(&self) -> TxnId {
+        self.id
+    }
+
+    fn timestamp(&self) -> NetworkTime {
+        self.timestamp
+    }
+
+    fn claim(&self) -> &Claim {
         &self.claim
     }
 }

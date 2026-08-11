@@ -152,34 +152,6 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
     } else {
         None
     };
-    if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_IF)) {
-        let items = map.next_value::<Vec<Scalar>>(()).await?;
-        let mut iter = items.into_iter();
-        let (cond, then, or_else) = match (iter.next(), iter.next(), iter.next(), iter.next()) {
-            (Some(cond), Some(then), Some(or_else), None) => (cond, then, or_else),
-            _ => {
-                return Err(de::Error::custom(
-                    "invalid Cond params (expected 3 elements)",
-                ))
-            }
-        };
-
-        let cond = match cond {
-            Scalar::Ref(r) => *r,
-            other => {
-                return Err(de::Error::custom(format!(
-                    "invalid Cond condition (expected ref, got {other:?})"
-                )))
-            }
-        };
-
-        while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-        }
-
-        return Ok(TCRef::Cond(Box::new(Cond::new(cond, then, or_else))));
-    }
-
     if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_COND)) {
         let items = map.next_value::<Vec<Scalar>>(()).await?;
         let mut iter = items.into_iter();
@@ -188,7 +160,7 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
             _ => {
                 return Err(de::Error::custom(
                     "invalid Cond params (expected 3 elements)",
-                ))
+                ));
             }
         };
 
@@ -197,7 +169,7 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
             other => {
                 return Err(de::Error::custom(format!(
                     "invalid Cond condition (expected ref, got {other:?})"
-                )))
+                )));
             }
         };
 
@@ -213,7 +185,11 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
         let mut iter = items.into_iter();
         let (when, then) = match (iter.next(), iter.next(), iter.next()) {
             (Some(when), Some(then), None) => (when, then),
-            _ => return Err(de::Error::custom("invalid After params (expected 2 elements)")),
+            _ => {
+                return Err(de::Error::custom(
+                    "invalid After params (expected 2 elements)",
+                ));
+            }
         };
 
         while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
@@ -231,7 +207,7 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
             _ => {
                 return Err(de::Error::custom(
                     "invalid While ref params (expected 3 elements)",
-                ))
+                ));
             }
         };
 
@@ -250,7 +226,7 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
             _ => {
                 return Err(de::Error::custom(
                     "invalid ForEach ref params (expected 3 elements)",
-                ))
+                ));
             }
         };
 
@@ -261,7 +237,7 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
             other => {
                 return Err(de::Error::custom(format!(
                     "invalid ForEach item_name (expected string, got {other:?})"
-                )))
+                )));
             }
         };
 
@@ -334,10 +310,7 @@ fn encode_cond<'en, E: en::Encoder<'en>>(cond: Cond, encoder: E) -> Result<E::Ok
     map.end()
 }
 
-fn encode_after<'en, E: en::Encoder<'en>>(
-    after: After,
-    encoder: E,
-) -> Result<E::Ok, E::Error> {
+fn encode_after<'en, E: en::Encoder<'en>>(after: After, encoder: E) -> Result<E::Ok, E::Error> {
     use destream::en::EncodeMap;
 
     let mut map = encoder.encode_map(Some(1))?;

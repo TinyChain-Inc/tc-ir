@@ -15,9 +15,11 @@ These guidelines describe the interaction patterns TinyChain IR must support so 
 
 ### Library helpers
 
-- Use the provided `tc_ir::StaticLibrary` when you want to bundle a `LibrarySchema` with a reusable routing table. It implements the `Library` trait directly, so runtimes can return it from factory methods without extra boilerplate.
+- Use `tc_ir::LibraryModule` to bundle a `LibrarySchema` with a reusable routing table. It implements `Library` directly, so runtimes can return it from factory methods without extra boilerplate.
 - Build route tables with the `tc_library_routes!` macro. It accepts string paths (e.g., `"/hello/world"`) and produces a validated `Dir` so you don’t have to manage `PathSegment` vectors manually.
-- See `tc-wasm/src/lib.rs`’s `example` module for a complete snippet (`hello_library`) that composes these helpers and can serve as a starting point for WASM crates.
+- Bind route tables to the kernel-provided transaction context at the adapter
+  boundary. Do not define a local transaction implementation in a library or
+  example merely to invoke a handler.
 
 ## Context requirements
 
@@ -61,8 +63,7 @@ The proposed payload and its design constraints live in `tc-ir/OP_GRAPH_IR.md`.
 - `TCRef::Cond` is the canonical conditional ref, encoded as `/state/scalar/ref/cond`
   with `[cond, then, or_else]`, where `cond` is a scalar ref and each branch is
   any scalar (including an `OpDef` scalar for lazy branch execution).
-- Legacy payloads encoded as `/state/scalar/ref/if` are accepted for decode compatibility
-  and normalized to `TCRef::Cond` in-memory.
+- Conditional references have one representation: `/state/scalar/ref/cond`.
 - `TCRef::ForEach` is encoded as `/state/scalar/ref/for_each` with `[items, op, item_name]`,
   where `items` is a scalar collection (tuple or map), `op` is an OpDef, and `item_name` is a
   string Id used as the item parameter when invoking `op`. When `items` is a map, iteration

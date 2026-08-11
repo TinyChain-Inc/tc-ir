@@ -205,7 +205,7 @@ taken, causing runtime failures. v1 users expect `if` branches to be lazy.
 ### v1 continuity choices
 
 - Use a single conditional ref, `Cond`, as the canonical representation.
-- Preserve decode compatibility for legacy `/state/scalar/ref/if` payloads by normalizing them to `Cond`.
+- Encode and decode conditionals only as `/state/scalar/ref/cond`.
 - Follow v1 naming patterns for boolean ops (`and`, `or`, `not`, `xor`) and avoid reusing bitwise dunders.
 
 ### Canonical IR ref: `Cond`
@@ -254,12 +254,11 @@ keeps name-binding explicit.
 Host resolvers should:
 - Support `/state/scalar/ref/cond` by evaluating only the selected branch.
 - Execute a selected branch lazily when it is encoded as an `OpDef` scalar.
-- Accept `/state/scalar/ref/if` during decode for legacy compatibility.
+- Reject non-canonical conditional paths during decode.
 
-### Compatibility & migration
+### Canonical representation
 
-- Existing graphs using `/state/scalar/ref/if` remain valid at decode time.
-- Canonical encode output uses `/state/scalar/ref/cond`.
+- Conditional graphs use `/state/scalar/ref/cond` for both encoding and decoding.
 
 ### Validation
 

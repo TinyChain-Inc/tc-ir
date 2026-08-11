@@ -14,7 +14,8 @@ pub struct LibrarySchema {
 }
 
 impl LibrarySchema {
-    /// Create a new schema with the given identifier, version, and dependency links.
+    /// Create a new schema with the given identifier, version, and dependency
+    /// links.
     pub fn new(id: Link, version: impl Into<String>, dependencies: Vec<Link>) -> Self {
         Self {
             id,
@@ -160,9 +161,6 @@ where
         &self.routes
     }
 }
-
-/// Backwards-compatible alias for the previous `StaticLibrary` type name.
-pub type StaticLibrary<Txn, Routes> = LibraryModule<Txn, Routes>;
 
 /// Trait implemented by every TinyChain library, whether native or WASM-backed.
 pub trait Library {
