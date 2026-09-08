@@ -81,6 +81,14 @@ structured unsupported-verb result. `Public<State>` is the shared
 route-and-invoke helper. There is no second call enum carrying a method and its
 arguments.
 
+`Public` calls `Route::route` exactly once for the selected verb invocation.
+After routing selects a `Handler`, that handler is terminal for the current
+request: its verb closure executes the operation or delegates directly to an
+already-selected leaf closure, but must not route the same path again. Recursive
+namespace traversal belongs in `Route`. A genuinely new nested invocation uses
+the runtime executor so its target, transaction scope, and authorization are
+preserved.
+
 `Transaction` is a native capability, not a serializable header. Real wire
 boundaries carry the canonical `TxnId` through their protocol-defined channel;
 authorization stays in that boundary's authenticated claim mechanism. Do not
