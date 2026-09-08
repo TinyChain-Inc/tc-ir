@@ -2,11 +2,11 @@
 
 use std::{
     collections::BTreeMap,
-    fmt,
     iter::FromIterator,
     ops::{Deref, DerefMut},
 };
 
+use async_hash::{Digest, Hash, Output};
 use destream::{de, en};
 use tc_error::{TCError, TCResult};
 
@@ -26,39 +26,6 @@ impl<T> Map<T> {
         }
     }
 
-    /// Construct a new [`Map`] with a single entry.
-    pub fn one(key: impl Into<Id>, value: T) -> Self {
-        let mut map = Self::new();
-        map.insert(key.into(), value);
-        map
-    }
-
-    /// Return an error if this [`Map`] is not empty.
-    pub fn expect_empty(self) -> TCResult<()>
-    where
-        T: fmt::Debug,
-    {
-        if self.is_empty() {
-            Ok(())
-        } else {
-            Err(TCError::unexpected(self, "no parameters"))
-        }
-    }
-
-    /// Retrieve this [`Map`]'s underlying [`BTreeMap`].
-    pub fn into_inner(self) -> BTreeMap<Id, T> {
-        self.inner
-    }
-
-    /// Remove and return the parameter with the given `name`, or `None` if not present.
-    pub fn optional(&mut self, name: &str) -> TCResult<Option<T>> {
-        let id: Id = name
-            .parse()
-            .map_err(|err| TCError::bad_request(format!("invalid map key id {name:?}: {err}")))?;
-
-        Ok(self.remove(&id))
-    }
-
     /// Remove and return the parameter with the given `name`, or a "not found" error.
     pub fn require(&mut self, name: &str) -> TCResult<T> {
         let id: Id = name
@@ -67,17 +34,6 @@ impl<T> Map<T> {
 
         self.remove(&id)
             .ok_or_else(|| TCError::not_found(format!("missing {name} parameter")))
-    }
-
-    /// Remove and return the parameter with the given `name`, or panic if missing.
-    pub fn expect(&mut self, name: &str) -> T
-    where
-        T: fmt::Debug,
-    {
-        match self.require(name) {
-            Ok(value) => value,
-            Err(err) => panic!("{err}"),
-        }
     }
 }
 
@@ -143,6 +99,22 @@ impl<T> From<BTreeMap<Id, T>> for Map<T> {
 impl<T> From<Map<T>> for BTreeMap<Id, T> {
     fn from(map: Map<T>) -> Self {
         map.inner
+    }
+}
+
+impl<D: Digest, T: Hash<D>> Hash<D> for Map<T> {
+    fn hash(self) -> Output<D> {
+        Hash::<D>::hash(self.inner)
+    }
+}
+
+impl<'a, D, T> Hash<D> for &'a Map<T>
+where
+    D: Digest,
+    &'a T: Hash<D>,
+{
+    fn hash(self) -> Output<D> {
+        Hash::<D>::hash(&self.inner)
     }
 }
 

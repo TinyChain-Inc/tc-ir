@@ -1,37 +1,23 @@
 # tc-ir
 
-`tc-ir` owns TinyChain's transport-neutral intermediate representation and the
-native routing contracts shared by hosts, state, libraries, and adapters.
+`tc-ir` owns TinyChain's transport-neutral scalar, reference, and operation
+algebra and the small native contracts shared by runtimes.
 
 ## Owned contracts
 
-- `Scalar`, `TCRef`, `OpRef`, and `OpDef` describe deferred computation.
-- `OpPlan` deterministically validates and schedules graph dependencies.
-- `ApplicationIdentity`, `ApplicationTarget`, and
-  `ApplicationDefinition<T>` define the canonical application URI and literal
-  one-entry definition.
-- The shared structural visitor provides semantic hashing, free-ID discovery,
-  and application-reference analysis without parallel walks.
-- `Route<State>`, `Handler<State>`, and `Public<State>` are the single native
-  routing and verb-dispatch boundary.
-- `Link`, `Claim`, `Transaction`, and `Transact` carry protocol identity,
-  authority, and resource lifecycle semantics without host state.
+- `Scalar`, `TCRef`, `OpRef`, `OpDef`, `Map`, and `Id` describe values and
+  deferred computation.
+- `Transaction` and `Transact` describe protocol identity and resource
+  lifecycle.
+- `MethodCall`, `Handler`, `Route`, and `Public` form the native verb and
+  routing boundary.
+- `IntoView` acquires a transaction-consistent native view independently of
+  wire encoding.
 
-The crate does not own graph execution, storage, HTTP, PyO3, WASM execution,
-application installation, or authorization policy. Those layers consume these
-contracts without changing their representation.
-
-## Applications
-
-An application definition has exactly one entry:
-
-```text
-/{class|lib|service}/{publisher}/{resource...}/{version} -> definition
-```
-
-`ApplicationTarget` is the sole parser for application namespace, identity, and
-route suffixes. Digests and dependency requirements are derived from canonical
-IR; they are not supplied in a package or metadata envelope.
+The crate does not interpret `State`, classify applications, schedule graphs,
+resolve dependencies, define installation payloads, or own runtime and adapter
+policy. The normative boundary is defined by the
+[IR interface guidelines](IR_INTERFACE_GUIDELINES.md).
 
 ## Development
 
@@ -39,8 +25,6 @@ IR; they are not supplied in a package or metadata envelope.
 cargo test --all-targets --all-features
 ```
 
-Changes to a wire or semantic contract require symmetric codec tests,
-deterministic analysis tests, and fixtures usable by other language bindings.
-See [the interface guidelines](IR_INTERFACE_GUIDELINES.md), the
-[crate invariants](AGENTS.md), and the workspace
+Changes to an IR form require symmetric codec tests. Changes to hashing require
+deterministic golden tests. See the [crate notes](AGENTS.md) and workspace
 [architecture](../ARCHITECTURE.md).

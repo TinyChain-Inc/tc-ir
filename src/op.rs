@@ -1,6 +1,8 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use crate::{Id, Map, Method, Scalar, Subject};
+use async_hash::{Digest, Hash, Output};
 use destream::{de, en, EncodeMap, IntoStream};
 use pathlink::PathBuf;
 
@@ -38,7 +40,7 @@ pub enum OpRef {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum OpDefType {
+pub(crate) enum OpDefType {
     Get,
     Put,
     Post,
@@ -89,7 +91,7 @@ pub enum OpDef {
 }
 
 impl OpDef {
-    pub fn form(&self) -> &Vec<(Id, Scalar)> {
+    pub fn form(&self) -> &[(Id, Scalar)] {
         match self {
             Self::Get((_, form)) => form,
             Self::Put((_, _, form)) => form,
@@ -117,6 +119,107 @@ impl OpDef {
             Self::Put(_) => Method::Put,
             Self::Post(_) => Method::Post,
             Self::Delete(_) => Method::Delete,
+        }
+    }
+
+    pub fn free_ids(&self) -> BTreeSet<Id> {
+        let mut required = self
+            .form()
+            .iter()
+            .flat_map(|(_, scalar)| scalar.free_ids())
+            .collect::<BTreeSet<_>>();
+        for (defined, _) in self.form() {
+            required.remove(defined);
+        }
+        match self {
+            Self::Get((key, _)) | Self::Delete((key, _)) => {
+                required.remove(key);
+            }
+            Self::Put((key, value, _)) => {
+                required.remove(key);
+                required.remove(value);
+            }
+            Self::Post(_) => {}
+        }
+        required
+    }
+}
+
+impl OpRef {
+    pub fn free_ids(&self) -> BTreeSet<Id> {
+        let mut ids = BTreeSet::new();
+        let subject = match self {
+            Self::Get((subject, key)) | Self::Delete((subject, key)) => {
+                ids.extend(key.free_ids());
+                subject
+            }
+            Self::Put((subject, key, value)) => {
+                ids.extend(key.free_ids());
+                ids.extend(value.free_ids());
+                subject
+            }
+            Self::Post((subject, params)) => {
+                ids.extend(params.values().flat_map(Scalar::free_ids));
+                subject
+            }
+        };
+        if let Subject::Ref(id, _) = subject {
+            if id.as_str() != "self" {
+                ids.insert(id.id().clone());
+            }
+        }
+        ids
+    }
+
+    pub(crate) fn collect_referenced_methods(
+        &self,
+        references: &mut BTreeMap<pathlink::Link, BTreeSet<Method>>,
+    ) {
+        let (method, subject) = match self {
+            Self::Get((subject, key)) => {
+                key.collect_referenced_methods(references);
+                (Method::Get, subject)
+            }
+            Self::Put((subject, key, value)) => {
+                key.collect_referenced_methods(references);
+                value.collect_referenced_methods(references);
+                (Method::Put, subject)
+            }
+            Self::Post((subject, params)) => {
+                for scalar in params.values() {
+                    scalar.collect_referenced_methods(references);
+                }
+                (Method::Post, subject)
+            }
+            Self::Delete((subject, key)) => {
+                key.collect_referenced_methods(references);
+                (Method::Delete, subject)
+            }
+        };
+        if let Subject::Link(link) = subject {
+            references.entry(link.clone()).or_default().insert(method);
+        }
+    }
+}
+
+impl<D: Digest> Hash<D> for &OpRef {
+    fn hash(self) -> Output<D> {
+        match self {
+            OpRef::Get((subject, key)) | OpRef::Delete((subject, key)) => {
+                Hash::<D>::hash((subject, key))
+            }
+            OpRef::Put((subject, key, value)) => Hash::<D>::hash((subject, key, value)),
+            OpRef::Post((subject, params)) => Hash::<D>::hash((subject, params)),
+        }
+    }
+}
+
+impl<D: Digest> Hash<D> for &OpDef {
+    fn hash(self) -> Output<D> {
+        match self {
+            OpDef::Get((key, form)) | OpDef::Delete((key, form)) => Hash::<D>::hash((key, form)),
+            OpDef::Put((key, value, form)) => Hash::<D>::hash((key, value, form)),
+            OpDef::Post(form) => Hash::<D>::hash(form),
         }
     }
 }

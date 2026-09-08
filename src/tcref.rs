@@ -1,5 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
+use async_hash::{Digest, Hash, Output};
 use destream::{de, en, IntoStream};
 use pathlink::PathBuf;
 
@@ -87,6 +89,84 @@ impl ForEach {
             items,
             op,
             item_name,
+        }
+    }
+}
+
+impl TCRef {
+    pub fn free_ids(&self) -> BTreeSet<Id> {
+        match self {
+            Self::Op(op) => op.free_ids(),
+            Self::Id(id) if id.as_str() != "self" => BTreeSet::from([id.id().clone()]),
+            Self::Id(_) => BTreeSet::new(),
+            Self::Cond(cond) => {
+                let mut ids = cond.cond.free_ids();
+                ids.extend(cond.then.free_ids());
+                ids.extend(cond.or_else.free_ids());
+                ids
+            }
+            Self::After(after) => {
+                let mut ids = after.when.free_ids();
+                ids.extend(after.then.free_ids());
+                ids
+            }
+            Self::While(while_ref) => {
+                let mut ids = while_ref.cond.free_ids();
+                ids.extend(while_ref.closure.free_ids());
+                ids.extend(while_ref.state.free_ids());
+                ids
+            }
+            Self::ForEach(for_each) => {
+                let mut ids = for_each.items.free_ids();
+                ids.extend(for_each.op.free_ids());
+                ids.remove(&for_each.item_name);
+                ids
+            }
+        }
+    }
+
+    pub(crate) fn collect_referenced_methods(
+        &self,
+        references: &mut BTreeMap<pathlink::Link, BTreeSet<crate::Method>>,
+    ) {
+        match self {
+            Self::Op(op) => op.collect_referenced_methods(references),
+            Self::Id(_) => {}
+            Self::Cond(cond) => {
+                cond.cond.collect_referenced_methods(references);
+                cond.then.collect_referenced_methods(references);
+                cond.or_else.collect_referenced_methods(references);
+            }
+            Self::After(after) => {
+                after.when.collect_referenced_methods(references);
+                after.then.collect_referenced_methods(references);
+            }
+            Self::While(while_ref) => {
+                while_ref.cond.collect_referenced_methods(references);
+                while_ref.closure.collect_referenced_methods(references);
+                while_ref.state.collect_referenced_methods(references);
+            }
+            Self::ForEach(for_each) => {
+                for_each.items.collect_referenced_methods(references);
+                for_each.op.collect_referenced_methods(references);
+            }
+        }
+    }
+}
+
+impl<D: Digest> Hash<D> for &TCRef {
+    fn hash(self) -> Output<D> {
+        match self {
+            TCRef::Op(op) => Hash::<D>::hash(op),
+            TCRef::Id(id) => Hash::<D>::hash(id),
+            TCRef::Cond(cond) => Hash::<D>::hash((&cond.cond, &cond.then, &cond.or_else)),
+            TCRef::After(after) => Hash::<D>::hash((&after.when, &after.then)),
+            TCRef::While(while_ref) => {
+                Hash::<D>::hash((&while_ref.cond, &while_ref.closure, &while_ref.state))
+            }
+            TCRef::ForEach(for_each) => {
+                Hash::<D>::hash((&for_each.items, &for_each.op, &for_each.item_name))
+            }
         }
     }
 }

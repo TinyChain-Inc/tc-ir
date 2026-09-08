@@ -5,10 +5,10 @@ hosts, and tooling consume. Keep it dependency-light and transport-neutral.
 
 ## How this crate fits into TinyChain
 
-- Owns `Scalar`, `TCRef`, application identity, deterministic graph analysis,
-  semantic traversal, and native handler contracts.
-- Defines the contract consumed by Python, WASM, State, and the host without
-  depending on any of those runtimes.
+- Owns the scalar/reference/operation algebra, intrinsic syntactic queries,
+  structural hashing, and shared native invocation/lifecycle contracts.
+- Defines contracts consumed by State and host runtimes without depending on
+  either runtime or on adapters.
 - Documents stable semantics in `IR_INTERFACE_GUIDELINES.md`; proposed shapes
   belong in a roadmap until implemented.
 

@@ -4,21 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-hash = { path = "../deps/async-hash", version = "0.6" }
 async-trait = "0.1"
 destream = { path = "../deps/destream", version = "0.10" }
-hr-id = { path = "../deps/hr-id", version = "0.7", features = ["stream"] }
+hr-id = { path = "../deps/hr-id", version = "0.7", features = ["hash", "stream"] }
 safecast = "0.2"
-serde = { version = "1", features = ["derive"] }
 umask = "2.1"
-pathlink = { path = "../deps/pathlink", features = ["stream"] }
-semver = "1"
-sha2 = "0.10"
+pathlink = { path = "../deps/pathlink", features = ["hash", "stream"] }
 tc-error = { path = "../tc-error" }
 tc-value = { path = "../tc-value" }
-number-general = { path = "../deps/number-general", version = "0.14", default-features = false, features = ["stream"] }
+number-general = { path = "../deps/number-general", version = "0.14", default-features = false, features = ["hash", "stream"] }
 
 [dev-dependencies]
-bytes = "1"
 destream_json = { path = "../deps/destream_json", version = "0.15", default-features = false }
-futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

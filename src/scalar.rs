@@ -1,5 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::{fmt, str::FromStr};
 
+use async_hash::{Digest, Hash, Output};
 use destream::{de, en, IntoStream};
 use number_general::Number;
 use pathlink::{path_label, Link, PathBuf, PathLabel};
@@ -25,93 +27,69 @@ pub enum Scalar {
     Op(crate::op::OpDef),
     Map(Map<Scalar>),
     Tuple(Vec<Scalar>),
-    /// A typed application member embedded in another literal definition.
-    Application(Box<crate::ApplicationDefinition<Scalar>>),
-}
-
-/// One node in the canonical recursive Scalar/reference traversal.
-#[derive(Clone, Copy)]
-pub enum ScalarNode<'a> {
-    Scalar(&'a Scalar),
-    Ref(&'a crate::TCRef),
-    Op(&'a crate::OpRef),
-    Subject(&'a crate::Subject),
-    Binding(&'a Id),
 }
 
 impl Scalar {
-    /// Visit recursive IR structure once, delegating meaning to the caller.
-    pub fn visit<'a>(&'a self, visitor: &mut impl FnMut(ScalarNode<'a>) -> bool) {
-        fn op<'a>(op: &'a crate::OpRef, visit: &mut impl FnMut(ScalarNode<'a>) -> bool) {
-            let _ = visit(ScalarNode::Op(op));
-            match op {
-                crate::OpRef::Get((subject, key)) | crate::OpRef::Delete((subject, key)) => {
-                    let _ = visit(ScalarNode::Subject(subject));
-                    key.visit(visit);
-                }
-                crate::OpRef::Put((subject, key, value)) => {
-                    let _ = visit(ScalarNode::Subject(subject));
-                    key.visit(visit);
-                    value.visit(visit);
-                }
-                crate::OpRef::Post((subject, params)) => {
-                    let _ = visit(ScalarNode::Subject(subject));
-                    for (name, scalar) in params {
-                        let _ = visit(ScalarNode::Binding(name));
-                        scalar.visit(visit);
-                    }
-                }
-            }
+    pub fn free_ids(&self) -> BTreeSet<Id> {
+        match self {
+            Self::Value(_) => BTreeSet::new(),
+            Self::Ref(reference) => reference.free_ids(),
+            Self::Op(op) => op.free_ids(),
+            Self::Map(map) => map.values().flat_map(Scalar::free_ids).collect(),
+            Self::Tuple(tuple) => tuple.iter().flat_map(Scalar::free_ids).collect(),
         }
+    }
 
-        fn walk_ref<'a>(
-            reference: &'a crate::TCRef,
-            visit: &mut impl FnMut(ScalarNode<'a>) -> bool,
-        ) {
-            let _ = visit(ScalarNode::Ref(reference));
-            match reference {
-                crate::TCRef::Id(_) => {}
-                crate::TCRef::Op(operation) => op(operation, visit),
-                crate::TCRef::Cond(cond) => {
-                    walk_ref(&cond.cond, visit);
-                    cond.then.visit(visit);
-                    cond.or_else.visit(visit);
-                }
-                crate::TCRef::After(after) => {
-                    after.when.visit(visit);
-                    after.then.visit(visit);
-                }
-                crate::TCRef::While(while_ref) => {
-                    while_ref.cond.visit(visit);
-                    while_ref.closure.visit(visit);
-                    while_ref.state.visit(visit);
-                }
-                crate::TCRef::ForEach(for_each) => {
-                    for_each.items.visit(visit);
-                    for_each.op.visit(visit);
-                    let _ = visit(ScalarNode::Binding(&for_each.item_name));
-                }
-            }
-        }
+    /// Return the methods invoked on concrete links in this scalar.
+    ///
+    /// This reports only the IR fact. Runtime owners decide whether a link names
+    /// an application, a native resource, or an external host.
+    pub fn referenced_methods(&self) -> BTreeMap<Link, BTreeSet<crate::Method>> {
+        let mut references = BTreeMap::new();
+        self.collect_referenced_methods(&mut references);
+        references
+    }
 
-        if !visitor(ScalarNode::Scalar(self)) {
-            return;
-        }
+    pub(crate) fn collect_referenced_methods(
+        &self,
+        references: &mut BTreeMap<Link, BTreeSet<crate::Method>>,
+    ) {
         match self {
             Self::Value(_) => {}
-            Self::Ref(reference_value) => walk_ref(reference_value, visitor),
-            Self::Op(operation) => {
-                for (name, scalar) in operation.form() {
-                    let _ = visitor(ScalarNode::Binding(name));
-                    scalar.visit(visitor);
+            Self::Ref(reference) => reference.collect_referenced_methods(references),
+            Self::Op(op) => {
+                for (_, scalar) in op.form() {
+                    scalar.collect_referenced_methods(references);
                 }
             }
-            Self::Map(map) => map.iter().for_each(|(name, scalar)| {
-                let _ = visitor(ScalarNode::Binding(name));
-                scalar.visit(visitor);
-            }),
-            Self::Tuple(tuple) => tuple.iter().for_each(|scalar| scalar.visit(visitor)),
-            Self::Application(definition) => definition.definition().visit(visitor),
+            Self::Map(map) => {
+                for scalar in map.values() {
+                    scalar.collect_referenced_methods(references);
+                }
+            }
+            Self::Tuple(tuple) => {
+                for scalar in tuple {
+                    scalar.collect_referenced_methods(references);
+                }
+            }
+        }
+    }
+}
+
+impl<D: Digest> Hash<D> for Scalar {
+    fn hash(self) -> Output<D> {
+        Hash::<D>::hash(&self)
+    }
+}
+
+impl<D: Digest> Hash<D> for &Scalar {
+    fn hash(self) -> Output<D> {
+        match self {
+            Scalar::Value(value) => Hash::<D>::hash(value),
+            Scalar::Ref(reference) => Hash::<D>::hash(reference.as_ref()),
+            Scalar::Op(op) => Hash::<D>::hash(op),
+            Scalar::Map(map) => Hash::<D>::hash(map),
+            Scalar::Tuple(tuple) => Hash::<D>::hash(tuple),
         }
     }
 }
@@ -178,8 +156,6 @@ pub enum Subject {
 pub const SCALAR_REF_PREFIX: PathLabel = path_label(&["state", "scalar", "ref"]);
 pub const OPREF_PREFIX: PathLabel = path_label(&["state", "scalar", "ref", "op"]);
 pub const OPDEF_PREFIX: PathLabel = path_label(&["state", "scalar", "op"]);
-pub const OPDEF_REFLECT_PREFIX: PathLabel = path_label(&["state", "scalar", "op", "reflect"]);
-pub const SCALAR_REFLECT_PREFIX: PathLabel = path_label(&["state", "scalar", "reflect"]);
 pub const SCALAR_MAP: PathLabel = path_label(&["state", "scalar", "map"]);
 pub const SCALAR_TUPLE: PathLabel = path_label(&["state", "scalar", "tuple"]);
 pub const OPREF_GET: PathLabel = path_label(&["state", "scalar", "ref", "op", "get"]);
@@ -194,14 +170,6 @@ pub const OPDEF_GET: PathLabel = path_label(&["state", "scalar", "op", "get"]);
 pub const OPDEF_PUT: PathLabel = path_label(&["state", "scalar", "op", "put"]);
 pub const OPDEF_POST: PathLabel = path_label(&["state", "scalar", "op", "post"]);
 pub const OPDEF_DELETE: PathLabel = path_label(&["state", "scalar", "op", "delete"]);
-pub const SCALAR_REFLECT_CLASS: PathLabel = path_label(&["state", "scalar", "reflect", "class"]);
-pub const SCALAR_REFLECT_REF_PARTS: PathLabel =
-    path_label(&["state", "scalar", "reflect", "ref_parts"]);
-pub const OPDEF_REFLECT_FORM: PathLabel = path_label(&["state", "scalar", "op", "reflect", "form"]);
-pub const OPDEF_REFLECT_LAST_ID: PathLabel =
-    path_label(&["state", "scalar", "op", "reflect", "last_id"]);
-pub const OPDEF_REFLECT_SCALARS: PathLabel =
-    path_label(&["state", "scalar", "op", "reflect", "scalars"]);
 
 impl de::FromStream for IdRef {
     type Context = ();
@@ -240,6 +208,18 @@ impl fmt::Display for Subject {
             Subject::Ref(id, path) if path.is_empty() => fmt::Display::fmt(id, f),
             Subject::Ref(id, path) => write!(f, "{id}{path}"),
         }
+    }
+}
+
+impl<D: Digest> Hash<D> for &IdRef {
+    fn hash(self) -> Output<D> {
+        Hash::<D>::hash(&self.0)
+    }
+}
+
+impl<D: Digest> Hash<D> for &Subject {
+    fn hash(self) -> Output<D> {
+        Hash::<D>::hash(self.to_string())
     }
 }
 
@@ -338,19 +318,6 @@ impl de::FromStream for Scalar {
                 };
 
                 if key.starts_with('/') {
-                    if let Ok(identity) = key.parse::<crate::ApplicationIdentity>() {
-                        if identity.kind() == crate::ApplicationKind::Class {
-                            let definition = map.next_value::<Scalar>(()).await?;
-                            if map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                                return Err(de::Error::custom(
-                                    "an application definition must contain exactly one URI entry",
-                                ));
-                            }
-                            return Ok(Scalar::Application(Box::new(
-                                crate::ApplicationDefinition::new(identity, definition),
-                            )));
-                        }
-                    }
                     if let Some(value) = decode_typed_value_map_entry(&key, &mut map).await? {
                         return Ok(Scalar::Value(value));
                     }
@@ -427,7 +394,6 @@ impl<'en> en::IntoStream<'en> for Scalar {
             Scalar::Op(op) => op.into_stream(encoder),
             Scalar::Map(map) => map.into_stream(encoder),
             Scalar::Tuple(tuple) => tuple.into_stream(encoder),
-            Scalar::Application(definition) => definition.into_stream(encoder),
         }
     }
 }
@@ -503,7 +469,7 @@ impl safecast::TryCastFrom<Scalar> for Value {
         match scalar {
             Scalar::Value(_) => true,
             Scalar::Tuple(items) => items.iter().all(Self::can_cast_from),
-            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) | Scalar::Application(_) => false,
+            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) => false,
         }
     }
 
@@ -517,7 +483,7 @@ impl safecast::TryCastFrom<Scalar> for Value {
                     .collect::<Option<Vec<_>>>()?;
                 Some(Value::Tuple(values))
             }
-            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) | Scalar::Application(_) => None,
+            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) => None,
         }
     }
 }
