@@ -55,6 +55,21 @@ impl<H> Dir<H> {
         }
     }
 
+    /// Return the number of mounted leaf handlers in this recursive directory.
+    pub fn len(&self) -> usize {
+        self.entries
+            .values()
+            .map(|entry| match entry {
+                DirEntry::Dir(dir) => dir.len(),
+                DirEntry::Handler(_) => 1,
+            })
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Build a directory from a collection of `(path, handler)` entries.
     pub fn from_routes<I>(routes: I) -> TCResult<Self>
     where

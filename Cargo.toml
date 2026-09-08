@@ -11,11 +11,14 @@ safecast = "0.2"
 serde = { version = "1", features = ["derive"] }
 umask = "2.1"
 pathlink = { path = "../deps/pathlink", features = ["stream"] }
+semver = "1"
+sha2 = "0.10"
 tc-error = { path = "../tc-error" }
 tc-value = { path = "../tc-value" }
 number-general = { path = "../deps/number-general", version = "0.14", default-features = false, features = ["stream"] }
 
 [dev-dependencies]
+bytes = "1"
 destream_json = { path = "../deps/destream_json", version = "0.15", default-features = false }
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -25,6 +25,95 @@ pub enum Scalar {
     Op(crate::op::OpDef),
     Map(Map<Scalar>),
     Tuple(Vec<Scalar>),
+    /// A typed application member embedded in another literal definition.
+    Application(Box<crate::ApplicationDefinition<Scalar>>),
+}
+
+/// One node in the canonical recursive Scalar/reference traversal.
+#[derive(Clone, Copy)]
+pub enum ScalarNode<'a> {
+    Scalar(&'a Scalar),
+    Ref(&'a crate::TCRef),
+    Op(&'a crate::OpRef),
+    Subject(&'a crate::Subject),
+    Binding(&'a Id),
+}
+
+impl Scalar {
+    /// Visit recursive IR structure once, delegating meaning to the caller.
+    pub fn visit<'a>(&'a self, visitor: &mut impl FnMut(ScalarNode<'a>) -> bool) {
+        fn op<'a>(op: &'a crate::OpRef, visit: &mut impl FnMut(ScalarNode<'a>) -> bool) {
+            let _ = visit(ScalarNode::Op(op));
+            match op {
+                crate::OpRef::Get((subject, key)) | crate::OpRef::Delete((subject, key)) => {
+                    let _ = visit(ScalarNode::Subject(subject));
+                    key.visit(visit);
+                }
+                crate::OpRef::Put((subject, key, value)) => {
+                    let _ = visit(ScalarNode::Subject(subject));
+                    key.visit(visit);
+                    value.visit(visit);
+                }
+                crate::OpRef::Post((subject, params)) => {
+                    let _ = visit(ScalarNode::Subject(subject));
+                    for (name, scalar) in params {
+                        let _ = visit(ScalarNode::Binding(name));
+                        scalar.visit(visit);
+                    }
+                }
+            }
+        }
+
+        fn walk_ref<'a>(
+            reference: &'a crate::TCRef,
+            visit: &mut impl FnMut(ScalarNode<'a>) -> bool,
+        ) {
+            let _ = visit(ScalarNode::Ref(reference));
+            match reference {
+                crate::TCRef::Id(_) => {}
+                crate::TCRef::Op(operation) => op(operation, visit),
+                crate::TCRef::Cond(cond) => {
+                    walk_ref(&cond.cond, visit);
+                    cond.then.visit(visit);
+                    cond.or_else.visit(visit);
+                }
+                crate::TCRef::After(after) => {
+                    after.when.visit(visit);
+                    after.then.visit(visit);
+                }
+                crate::TCRef::While(while_ref) => {
+                    while_ref.cond.visit(visit);
+                    while_ref.closure.visit(visit);
+                    while_ref.state.visit(visit);
+                }
+                crate::TCRef::ForEach(for_each) => {
+                    for_each.items.visit(visit);
+                    for_each.op.visit(visit);
+                    let _ = visit(ScalarNode::Binding(&for_each.item_name));
+                }
+            }
+        }
+
+        if !visitor(ScalarNode::Scalar(self)) {
+            return;
+        }
+        match self {
+            Self::Value(_) => {}
+            Self::Ref(reference_value) => walk_ref(reference_value, visitor),
+            Self::Op(operation) => {
+                for (name, scalar) in operation.form() {
+                    let _ = visitor(ScalarNode::Binding(name));
+                    scalar.visit(visitor);
+                }
+            }
+            Self::Map(map) => map.iter().for_each(|(name, scalar)| {
+                let _ = visitor(ScalarNode::Binding(name));
+                scalar.visit(visitor);
+            }),
+            Self::Tuple(tuple) => tuple.iter().for_each(|scalar| scalar.visit(visitor)),
+            Self::Application(definition) => definition.definition().visit(visitor),
+        }
+    }
 }
 
 /// A reference to a named value in a scope (e.g. "$self").
@@ -249,6 +338,19 @@ impl de::FromStream for Scalar {
                 };
 
                 if key.starts_with('/') {
+                    if let Ok(identity) = key.parse::<crate::ApplicationIdentity>() {
+                        if identity.kind() == crate::ApplicationKind::Class {
+                            let definition = map.next_value::<Scalar>(()).await?;
+                            if map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+                                return Err(de::Error::custom(
+                                    "an application definition must contain exactly one URI entry",
+                                ));
+                            }
+                            return Ok(Scalar::Application(Box::new(
+                                crate::ApplicationDefinition::new(identity, definition),
+                            )));
+                        }
+                    }
                     if let Some(value) = decode_typed_value_map_entry(&key, &mut map).await? {
                         return Ok(Scalar::Value(value));
                     }
@@ -325,6 +427,7 @@ impl<'en> en::IntoStream<'en> for Scalar {
             Scalar::Op(op) => op.into_stream(encoder),
             Scalar::Map(map) => map.into_stream(encoder),
             Scalar::Tuple(tuple) => tuple.into_stream(encoder),
+            Scalar::Application(definition) => definition.into_stream(encoder),
         }
     }
 }
@@ -395,59 +498,12 @@ impl From<u64> for Scalar {
     }
 }
 
-impl Scalar {
-    pub fn walk(&self) -> ScalarWalk<'_> {
-        ScalarWalk::new(self)
-    }
-
-    pub fn walk_tcref(&self) -> impl Iterator<Item = &crate::tcref::TCRef> {
-        self.walk().filter_map(|scalar| match scalar {
-            Scalar::Ref(r) => Some(r.as_ref()),
-            _ => None,
-        })
-    }
-}
-
-pub struct ScalarWalk<'a> {
-    stack: Vec<&'a Scalar>,
-}
-
-impl<'a> ScalarWalk<'a> {
-    pub(crate) fn new(root: &'a Scalar) -> Self {
-        Self { stack: vec![root] }
-    }
-}
-
-impl<'a> Iterator for ScalarWalk<'a> {
-    type Item = &'a Scalar;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let next = self.stack.pop()?;
-
-        match next {
-            Scalar::Map(map) => {
-                for value in map.values().rev() {
-                    self.stack.push(value);
-                }
-            }
-            Scalar::Tuple(items) => {
-                for value in items.iter().rev() {
-                    self.stack.push(value);
-                }
-            }
-            _ => {}
-        }
-
-        Some(next)
-    }
-}
-
 impl safecast::TryCastFrom<Scalar> for Value {
     fn can_cast_from(scalar: &Scalar) -> bool {
         match scalar {
             Scalar::Value(_) => true,
             Scalar::Tuple(items) => items.iter().all(Self::can_cast_from),
-            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) => false,
+            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) | Scalar::Application(_) => false,
         }
     }
 
@@ -461,7 +517,7 @@ impl safecast::TryCastFrom<Scalar> for Value {
                     .collect::<Option<Vec<_>>>()?;
                 Some(Value::Tuple(values))
             }
-            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) => None,
+            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) | Scalar::Application(_) => None,
         }
     }
 }

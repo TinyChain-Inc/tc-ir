@@ -40,6 +40,16 @@ pub use dir::*;
 mod library;
 pub use library::*;
 
+mod application;
+pub use application::*;
+mod analysis;
+pub use analysis::{application_requirements, visit_members, ApplicationRequirement, OpPlan};
+mod reflect;
+pub use reflect::{reflection_param, Reflection};
+
+mod semantic;
+pub use semantic::{SemanticHash, SemanticHasher};
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -108,25 +118,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.0, "hello world");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn library_schema_destream_roundtrip() {
-        let schema = LibrarySchema::new(
-            Link::from_str("/lib/service").expect("link"),
-            "0.1.0",
-            vec![
-                Link::from_str("/lib/dependency").expect("dep"),
-                Link::from_str("/lib/other").expect("dep"),
-            ],
-        );
-
-        let encoded = destream_json::encode(schema.clone()).expect("encode schema");
-        let decoded: LibrarySchema = destream_json::try_decode((), encoded)
-            .await
-            .expect("decode schema");
-
-        assert_eq!(decoded, schema);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -398,20 +389,6 @@ mod tests {
             .expect("decode tcref for_each");
 
         assert_eq!(decoded, tcref);
-    }
-
-    #[test]
-    fn library_module_wraps_schema_and_routes() {
-        let schema = LibrarySchema::new(Link::from_str("/lib/service").unwrap(), "1.0.0", vec![]);
-        let routes = tc_library_routes! {
-            "/lib/status" => HelloHandler,
-        }
-        .expect("routes");
-
-        let lib: LibraryModule<FakeState, _> = LibraryModule::new(schema.clone(), routes);
-        assert_eq!(lib.schema(), &schema);
-        let path = [segment("lib"), segment("status")];
-        assert!(lib.routes().route(&path).is_some());
     }
 
     #[test]

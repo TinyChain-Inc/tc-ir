@@ -1,93 +1,81 @@
-# TinyChain IR Access Guidelines
+# TinyChain IR Interface Guidelines
 
-These guidelines describe the interaction patterns TinyChain IR must support so multiple bindings (WASM, PyO3, etc.) can share consistent semantics. Detailed trait definitions and signatures will be specified later.
+This document defines the stable boundaries exposed by `tc-ir`. Concrete
+storage, execution, authorization, and transport policy belongs to downstream
+owners.
 
-## Interaction patterns
+## Native routing
 
-- **Stateless operations:** Support simple request/response logic that reads transactional state without mutating it.
-- **Stateful operations:** Allow methods that mutate collections or resources while holding an exclusive transactional lock.
-- **Asynchronous tasks:** Provide a way to run longer-lived or IO-bound work under scheduler control, with explicit cancellation and retry semantics.
-- **Per-method registration:** Each handler declares its HTTP verb/path support at compile time via dedicated `get/put/post/delete` methods. The default implementations return `Err(TCError::method_not_allowed(..))`, so handlers only override the verbs they support while routers get structured errors for unsupported verbs.
-- **Typed inputs/outputs:** Handler impls should operate on concrete Rust types; the L0 runtime (e.g. `tc-server`) is responsible for deserializing ingress requests into those types and serializing responses back to `State`/`Value` at the boundary, so handler graphs stay fully typed internally.
-- **Zero-cost sync support:** Even though handlers use async-friendly futures (GATs), a purely synchronous handler can set `type Fut<'a> = core::future::Ready<Result<...>>` (or another concrete future) and return `future::ready(...)`, avoiding heap allocations entirely. Reserve boxed futures for handlers that truly need dynamic dispatch.
-- **Reusable handler instances:** Handlers are expected to be long-lived structs registered at compile time. Once constructed, they should be callable many times (even inside tight loops) without cloning or rerouting through HTTP-style dispatch. Compose ops by invoking handlers/functions directly with their typed inputs rather than re-routing to `/state/<collection>/add` on each iteration.
-- **Method-not-supported signaling:** The per-verb methods return a `TCResult`; the default implementations yield `TCError::method_not_allowed`, so handler implementations only override the verbs they actually serve.
+`Route<State>` resolves a path to one `Handler<State>`. `Handler<State>` exposes
+GET, PUT, POST, and DELETE over native values and the explicit transaction
+capability; unsupported verbs use its default structured error. `Public<State>`
+is the shared route-and-invoke helper.
 
-### Library helpers
+Handlers never receive codecs, HTTP bodies, Python objects, WASM memory, or host
+storage. In-process composition passes native `State` directly. Serialization
+occurs only at a transport, persistence, sandbox, or foreign-runtime boundary.
+`Arc<H>` delegates `Handler<State>` so recursive directories can contain one
+heterogeneous handler tree without another dispatch enum.
 
-- Use `tc_ir::LibraryModule` to bundle a `LibrarySchema` with a reusable routing table. It implements `Library` directly, so runtimes can return it from factory methods without extra boilerplate.
-- Build route tables with the `tc_library_routes!` macro. It accepts string paths (e.g., `"/hello/world"`) and produces a validated `Dir` so you don’t have to manage `PathSegment` vectors manually.
-- Bind route tables to the kernel-provided transaction context at the adapter
-  boundary. Do not define a local transaction implementation in a library or
-  example merely to invoke a handler.
+## Application identity and definitions
 
-## Context requirements
+`ApplicationDefinition<T>` contains exactly one mapping from a canonical
+application identity to its complete definition:
 
-Every IR invocation should implicitly receive at least:
+```text
+/{kind}/{publisher}/{resource...}/{semantic-version} -> definition
+```
 
-- A transactional guard to allow ordering.
-- The set of permissions/capability bits granted to the caller.
-- The latest deterministic host health snapshot applicable to the shard.
+There is at least one resource segment. `.txfs` and semantic-version-shaped
+resource segments are reserved. `ApplicationTarget` parses namespace targets,
+complete identities, and unmatched route suffixes once; downstream code must
+not reconstruct or rescan the path.
 
-Bindings should hide these details from user code but must honor them under the hood.
+Definitions have no generic package, artifact, schema, version, digest, or
+payload envelope. Semantic digests and application requirements are derived
+from the definition. Unsupported persisted or wire forms fail closed.
 
-## Determinism & purity guidelines
+## Graph analysis
 
-- Handlers may not rely on local wall-clock time; they should use transaction-provided timestamps.
-- Inputs and outputs must be serializable with a `destream`.
+`Scalar`, `TCRef`, `OpRef`, and `OpDef` are the canonical graph vocabulary.
+`OpPlan::compile` validates providers, detects cycles, and returns deterministic
+dependency levels. `OpDef::free_ids` and `Scalar::application_requirements`
+reuse the same structural traversal.
 
-## Execution ordering model
+Application requirements are keyed deterministically by identity and aggregate
+the required native methods. Conflicting authorities for one identity are
+invalid. Resolution of a requirement to a committed digest and executable
+authority belongs to the host, not the IR.
 
-- TinyChain executes by dataflow dependency, not by lexical/source order.
-- Independent nodes may execute concurrently when they have no dependency edge.
-- A dependency edge exists when one node consumes another node's output, or when
-  the graph includes an explicit ordering reference.
+Execution follows data dependencies, not lexical source order. Independent
+nodes may run concurrently. A side effect that requires ordering must use an
+explicit dependency such as `After`; bindings must not infer sequencing from
+source order.
 
-For side effects, ordering must be explicit. Bindings and compilers must not infer
-or synthesize side-effect sequencing from statement order. Developers must add an
-explicit `After` reference whenever two side-effecting operations require order
-and no natural data dependency already enforces it.
+## Control references
 
-## Op-graph payloads
+Conditional, sequential, parameter, `while`, and `for_each` forms are ordinary
+`TCRef` variants. Their codecs are symmetric and their traversal order is
+deterministic. They carry graph semantics only; deadline enforcement,
+scheduling, admission, and `OpDef` execution belong to the runtime.
 
-TinyChain v2 supports a transport-neutral op-graph payload intended to make workloads **inspectable**
-as data (deterministic DAG + fixed-count `Repeat`), so libraries/services can perform static analysis
-(metrics, conservative bounds, safety checks) without baking policy (billing, pricing, risk) into the IR.
+## Semantic hashing and codecs
 
-The proposed payload and its design constraints live in `tc-ir/OP_GRAPH_IR.md`.
+Semantic hashing uses the shared format-neutral visitor with explicit domain
+tags, collection lengths, and deterministic map ordering. It must not depend on
+JSON whitespace or transport encoding.
 
-## Scalar reference control flow
+Every `FromStream` implementation accepts exactly the form emitted by its
+`IntoStream` implementation. Codec changes require valid and malformed fixtures
+which other language bindings can consume. Encoding is never used internally
+for equality, hashing, cloning, validation, or routing.
 
-- `TCRef::While` is encoded as `/state/scalar/ref/while` with a three-element tuple
-  `[cond, closure, state]`, mirroring v1 semantics.
-- `TCRef::Cond` is the canonical conditional ref, encoded as `/state/scalar/ref/cond`
-  with `[cond, then, or_else]`, where `cond` is a scalar ref and each branch is
-  any scalar (including an `OpDef` scalar for lazy branch execution).
-- Conditional references have one representation: `/state/scalar/ref/cond`.
-- `TCRef::ForEach` is encoded as `/state/scalar/ref/for_each` with `[items, op, item_name]`,
-  where `items` is a scalar collection (tuple or map), `op` is an OpDef, and `item_name` is a
-  string Id used as the item parameter when invoking `op`. When `items` is a map, iteration
-  yields keys in deterministic `Id` order.
-- The loop condition and closure are OpDefs, executed with a loop-carried `state` input.
+## Review checklist
 
-## Error & backpressure expectations
+A change to `tc-ir` should answer:
 
-- Handlers report standardized error categories (authorization, validation, transient, etc.) so callers can take consistent action.
-- Asynchronous/streaming handlers must signal when they need to yield or when backpressure should be applied, without leaking implementation-specific types.
-
-## Validation guidance
-
-`tc-ir` will eventually ship compliance tests to confirm that a binding:
-
-1. Declares which interaction patterns each handler uses.
-2. Produces deterministic results when invoked repeatedly with identical inputs.
-3. Enforces capability masks consistently across all patterns.
-4. Cooperates with the global scheduler for asynchronous and streaming workloads.
-
-## Authorization alignment
-
-- Authorization data will be the same used by the upstream control plane (e.g., the a16z server reference implementation). To stay in sync:
-  - Control-plane services issue short-lived tokens that embed principal ID, tenant ID, capability bits, and quota hints. Bindings consume these tokens via the implicit authorization context, not by parsing headers manually.
-  - Trait implementors must treat capability bits as the sole source of truth for what an operation may do; no handler should hard-code policy independent of the control plane.
-  - When the control plane updates capability definitions or tenant policies, bindings must be able to reload the new policy bundle without code changes.
-- The IR guidelines here define how handlers *consume* authorization; the actual issuance, validation, and rotation flows remain centralized in the control-plane/a16z server stack. Any divergence between the two must be treated as a compatibility bug.
+1. Is this the lowest shared owner of the semantic contract?
+2. Does it reuse the existing application parser and structural visitor?
+3. Is native execution still independent of serialization and transport?
+4. Are ordering and failure behavior deterministic?
+5. Do symmetric codecs and cross-language fixtures cover the change?

@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use pathlink::PathSegment;
@@ -7,7 +8,7 @@ use tc_error::{TCError, TCResult};
 use crate::{Map, Scalar, Transaction};
 
 /// Native verbs supported by TinyChain routers and projected by adapters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum Method {
     Get,
     Put,
@@ -29,6 +30,20 @@ impl Method {
 impl std::fmt::Display for Method {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Method {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_uppercase().as_str() {
+            "GET" => Ok(Self::Get),
+            "PUT" => Ok(Self::Put),
+            "POST" => Ok(Self::Post),
+            "DELETE" => Ok(Self::Delete),
+            _ => Err(format!("unsupported method: {value}")),
+        }
     }
 }
 
@@ -76,6 +91,52 @@ where
             Method::Delete,
             std::any::type_name::<Self>(),
         ))
+    }
+}
+
+#[async_trait]
+impl<State, H> Handler<State> for Arc<H>
+where
+    State: StateInstance,
+    H: Handler<State> + ?Sized,
+{
+    async fn get(&self, txn: &State::Transaction, key: Scalar) -> TCResult<State> {
+        (**self).get(txn, key).await
+    }
+
+    async fn put(&self, txn: &State::Transaction, key: Scalar, value: State) -> TCResult<()> {
+        (**self).put(txn, key, value).await
+    }
+
+    async fn post(&self, txn: &State::Transaction, params: Map<State>) -> TCResult<State> {
+        (**self).post(txn, params).await
+    }
+
+    async fn delete(&self, txn: &State::Transaction, key: Scalar) -> TCResult<()> {
+        (**self).delete(txn, key).await
+    }
+}
+
+#[async_trait]
+impl<State, H> Handler<State> for &H
+where
+    State: StateInstance,
+    H: Handler<State> + ?Sized,
+{
+    async fn get(&self, txn: &State::Transaction, key: Scalar) -> TCResult<State> {
+        (**self).get(txn, key).await
+    }
+
+    async fn put(&self, txn: &State::Transaction, key: Scalar, value: State) -> TCResult<()> {
+        (**self).put(txn, key, value).await
+    }
+
+    async fn post(&self, txn: &State::Transaction, params: Map<State>) -> TCResult<State> {
+        (**self).post(txn, params).await
+    }
+
+    async fn delete(&self, txn: &State::Transaction, key: Scalar) -> TCResult<()> {
+        (**self).delete(txn, key).await
     }
 }
 

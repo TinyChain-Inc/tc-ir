@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::{Id, Map, Scalar, Subject};
+use crate::{Id, Map, Method, Scalar, Subject};
 use destream::{de, en, EncodeMap, IntoStream};
 use pathlink::PathBuf;
 
@@ -111,8 +111,13 @@ impl OpDef {
         }
     }
 
-    pub fn walk_scalars(&self) -> OpDefScalarWalk<'_> {
-        OpDefScalarWalk::new(self)
+    pub const fn method(&self) -> Method {
+        match self {
+            Self::Get(_) => Method::Get,
+            Self::Put(_) => Method::Put,
+            Self::Post(_) => Method::Post,
+            Self::Delete(_) => Method::Delete,
+        }
     }
 }
 
@@ -439,35 +444,4 @@ pub(crate) async fn decode_opref_map_entry<A: de::MapAccess>(
     }
 
     Ok(op)
-}
-
-pub struct OpDefScalarWalk<'a> {
-    form_iter: std::slice::Iter<'a, (Id, Scalar)>,
-    current: Option<crate::scalar::ScalarWalk<'a>>,
-}
-
-impl<'a> OpDefScalarWalk<'a> {
-    fn new(op: &'a OpDef) -> Self {
-        Self {
-            form_iter: op.form().iter(),
-            current: None,
-        }
-    }
-}
-
-impl<'a> Iterator for OpDefScalarWalk<'a> {
-    type Item = &'a Scalar;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(current) = &mut self.current {
-                if let Some(item) = current.next() {
-                    return Some(item);
-                }
-            }
-
-            let (_, scalar) = self.form_iter.next()?;
-            self.current = Some(crate::scalar::ScalarWalk::new(scalar));
-        }
-    }
 }
