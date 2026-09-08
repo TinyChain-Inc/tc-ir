@@ -183,6 +183,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn scalar_maps_reject_duplicate_input_names() {
+        use bytes::Bytes;
+        use futures::{future, stream};
+
+        let source = stream::once(future::ready(Ok::<_, std::convert::Infallible>(
+            Bytes::from_static(br#"{"input":1,"input":2}"#),
+        )));
+        let decoded: Result<Scalar, _> = destream_json::try_decode((), source).await;
+        let error = decoded.expect_err("reject duplicate input name");
+        assert!(error.to_string().contains("duplicate map key input"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn scalar_tuple_roundtrip() {
         let scalar = Scalar::Tuple(vec![Scalar::from(7_u64), Scalar::from(Value::from("x"))]);
 

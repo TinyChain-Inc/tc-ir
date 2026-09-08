@@ -5,7 +5,7 @@ use async_hash::{Digest, Hash, Output};
 use destream::{de, en, IntoStream};
 use number_general::Number;
 use pathlink::{path_label, Link, PathBuf, PathLabel};
-use tc_error::TCError;
+use tc_error::{TCError, TCResult};
 use tc_value::{decode_typed_value_map_entry, Value};
 
 use crate::{Id, Map};
@@ -30,13 +30,45 @@ pub enum Scalar {
 }
 
 impl Scalar {
-    pub fn free_ids(&self) -> BTreeSet<Id> {
+    /// Add the lexical bindings required to resolve this scalar.
+    ///
+    /// This is a syntactic query. It neither resolves nor mutates a runtime
+    /// namespace; the caller owns the request-local accumulator.
+    pub fn requires(&self, required: &mut BTreeSet<Id>) {
         match self {
-            Self::Value(_) => BTreeSet::new(),
-            Self::Ref(reference) => reference.free_ids(),
-            Self::Op(op) => op.free_ids(),
-            Self::Map(map) => map.values().flat_map(Scalar::free_ids).collect(),
-            Self::Tuple(tuple) => tuple.iter().flat_map(Scalar::free_ids).collect(),
+            Self::Value(_) => {}
+            Self::Ref(reference) => reference.requires(required),
+            Self::Op(op) => op.requires(required),
+            Self::Map(map) => {
+                for scalar in map.values() {
+                    scalar.requires(required);
+                }
+            }
+            Self::Tuple(tuple) => {
+                for scalar in tuple {
+                    scalar.requires(required);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn validate_scope(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
+        match self {
+            Self::Value(_) => Ok(()),
+            Self::Ref(reference) => reference.validate_scope(visible),
+            Self::Op(op) => op.validate_with_visible(visible),
+            Self::Map(map) => {
+                for scalar in map.values() {
+                    scalar.validate_scope(visible)?;
+                }
+                Ok(())
+            }
+            Self::Tuple(tuple) => {
+                for scalar in tuple {
+                    scalar.validate_scope(visible)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -366,7 +398,9 @@ impl de::FromStream for Scalar {
                     let id: Id = key
                         .parse::<Id>()
                         .map_err(|err| de::Error::custom(err.to_string()))?;
-                    out.insert(id, value);
+                    if out.insert(id.clone(), value).is_some() {
+                        return Err(de::Error::custom(format!("duplicate map key {id}")));
+                    }
                 }
 
                 Ok(Scalar::Map(out))

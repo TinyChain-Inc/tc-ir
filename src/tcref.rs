@@ -4,6 +4,7 @@ use std::str::FromStr;
 use async_hash::{Digest, Hash, Output};
 use destream::{de, en, IntoStream};
 use pathlink::PathBuf;
+use tc_error::{TCError, TCResult};
 
 use crate::{Id, IdRef, Scalar};
 use tc_value::Value;
@@ -94,33 +95,82 @@ impl ForEach {
 }
 
 impl TCRef {
-    pub fn free_ids(&self) -> BTreeSet<Id> {
+    pub fn requires(&self, required: &mut BTreeSet<Id>) {
         match self {
-            Self::Op(op) => op.free_ids(),
-            Self::Id(id) if id.as_str() != "self" => BTreeSet::from([id.id().clone()]),
-            Self::Id(_) => BTreeSet::new(),
+            Self::Op(op) => op.requires(required),
+            Self::Id(id) if id.as_str() != "self" => {
+                required.insert(id.id().clone());
+            }
+            Self::Id(_) => {}
             Self::Cond(cond) => {
-                let mut ids = cond.cond.free_ids();
-                ids.extend(cond.then.free_ids());
-                ids.extend(cond.or_else.free_ids());
-                ids
+                cond.cond.requires(required);
+                cond.then.requires(required);
+                cond.or_else.requires(required);
             }
             Self::After(after) => {
-                let mut ids = after.when.free_ids();
-                ids.extend(after.then.free_ids());
-                ids
+                after.when.requires(required);
+                after.then.requires(required);
             }
             Self::While(while_ref) => {
-                let mut ids = while_ref.cond.free_ids();
-                ids.extend(while_ref.closure.free_ids());
-                ids.extend(while_ref.state.free_ids());
-                ids
+                let mut callbacks = BTreeSet::new();
+                while_ref.cond.requires(&mut callbacks);
+                while_ref.closure.requires(&mut callbacks);
+                callbacks.retain(|id| id.as_str() != "state");
+                required.extend(callbacks);
+                while_ref.state.requires(required);
             }
             Self::ForEach(for_each) => {
-                let mut ids = for_each.items.free_ids();
-                ids.extend(for_each.op.free_ids());
-                ids.remove(&for_each.item_name);
-                ids
+                for_each.items.requires(required);
+
+                // The loop item is bound only within the loop body. Collect
+                // locally so removing it cannot erase a requirement from a
+                // sibling expression.
+                let mut body = BTreeSet::new();
+                for_each.op.requires(&mut body);
+                body.remove(&for_each.item_name);
+                required.extend(body);
+            }
+        }
+    }
+
+    pub(crate) fn validate_scope(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
+        match self {
+            Self::Op(op) => op.validate_scope(visible),
+            Self::Id(_) => Ok(()),
+            Self::Cond(cond) => {
+                cond.cond.validate_scope(visible)?;
+                cond.then.validate_scope(visible)?;
+                cond.or_else.validate_scope(visible)
+            }
+            Self::After(after) => {
+                after.when.validate_scope(visible)?;
+                after.then.validate_scope(visible)
+            }
+            Self::While(while_ref) => {
+                while_ref.state.validate_scope(visible)?;
+                let state: Id = "state"
+                    .parse()
+                    .map_err(|err| TCError::internal(format!("invalid while binding: {err}")))?;
+                let mut callback_scope = visible.clone();
+                crate::op::bind(
+                    &mut callback_scope,
+                    &mut BTreeSet::new(),
+                    &state,
+                    "While callback parameter",
+                )?;
+                while_ref.cond.validate_scope(&callback_scope)?;
+                while_ref.closure.validate_scope(&callback_scope)
+            }
+            Self::ForEach(for_each) => {
+                for_each.items.validate_scope(visible)?;
+                let mut body_scope = visible.clone();
+                crate::op::bind(
+                    &mut body_scope,
+                    &mut BTreeSet::new(),
+                    &for_each.item_name,
+                    "ForEach item",
+                )?;
+                for_each.op.validate_scope(&body_scope)
             }
         }
     }

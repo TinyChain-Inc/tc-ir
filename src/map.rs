@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     iter::FromIterator,
+    marker::PhantomData,
     ops::{Deref, DerefMut},
 };
 
@@ -125,11 +126,37 @@ where
     type Context = ();
 
     async fn from_stream<D: de::Decoder>(
-        context: Self::Context,
+        _context: Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        let inner = BTreeMap::<Id, T>::from_stream(context, decoder).await?;
-        Ok(Self { inner })
+        struct MapVisitor<T>(PhantomData<T>);
+
+        impl<T> de::Visitor for MapVisitor<T>
+        where
+            T: de::FromStream<Context = ()>,
+        {
+            type Value = Map<T>;
+
+            fn expecting() -> &'static str {
+                "a map with unique TinyChain IDs"
+            }
+
+            async fn visit_map<A: de::MapAccess>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut inner = BTreeMap::new();
+                while let Some(key) = access.next_key::<Id>(()).await? {
+                    let value = access.next_value::<T>(()).await?;
+                    if inner.insert(key.clone(), value).is_some() {
+                        return Err(de::Error::custom(format!("duplicate map key {key}")));
+                    }
+                }
+                Ok(Map { inner })
+            }
+        }
+
+        decoder.decode_map(MapVisitor(PhantomData)).await
     }
 }
 
