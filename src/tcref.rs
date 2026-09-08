@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use async_hash::{Digest, Hash, Output};
@@ -125,30 +125,30 @@ impl TCRef {
         }
     }
 
-    pub(crate) fn collect_referenced_methods(
+    pub(crate) fn visit_referenced_methods(
         &self,
-        references: &mut BTreeMap<pathlink::Link, BTreeSet<crate::Method>>,
+        visitor: &mut impl FnMut(&pathlink::Link, crate::Method),
     ) {
         match self {
-            Self::Op(op) => op.collect_referenced_methods(references),
+            Self::Op(op) => op.visit_referenced_methods(visitor),
             Self::Id(_) => {}
             Self::Cond(cond) => {
-                cond.cond.collect_referenced_methods(references);
-                cond.then.collect_referenced_methods(references);
-                cond.or_else.collect_referenced_methods(references);
+                cond.cond.visit_referenced_methods(visitor);
+                cond.then.visit_referenced_methods(visitor);
+                cond.or_else.visit_referenced_methods(visitor);
             }
             Self::After(after) => {
-                after.when.collect_referenced_methods(references);
-                after.then.collect_referenced_methods(references);
+                after.when.visit_referenced_methods(visitor);
+                after.then.visit_referenced_methods(visitor);
             }
             Self::While(while_ref) => {
-                while_ref.cond.collect_referenced_methods(references);
-                while_ref.closure.collect_referenced_methods(references);
-                while_ref.state.collect_referenced_methods(references);
+                while_ref.cond.visit_referenced_methods(visitor);
+                while_ref.closure.visit_referenced_methods(visitor);
+                while_ref.state.visit_referenced_methods(visitor);
             }
             Self::ForEach(for_each) => {
-                for_each.items.collect_referenced_methods(references);
-                for_each.op.collect_referenced_methods(references);
+                for_each.items.visit_referenced_methods(visitor);
+                for_each.op.visit_referenced_methods(visitor);
             }
         }
     }

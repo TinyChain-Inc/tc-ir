@@ -22,12 +22,13 @@ Maps and tuples compose these forms recursively. Control flow is expressed by
 ordinary `TCRef` variants; no adapter or application-specific scalar variant is
 permitted.
 
-Free-ID discovery and referenced-method discovery are intrinsic recursive
+Free-ID discovery and referenced-method visitation are intrinsic recursive
 queries on these owning values. Free IDs describe syntax, not an execution
-plan. Referenced methods are syntactic Link/verb observations, not application
-dependencies or authorization grants. Scheduling, missing-provider and cycle
-errors, bounded concurrency, deadlines, and `OpDef` execution belong to the
-runtime which consumes them.
+plan. The reference visitor reports individual Link/verb occurrences without
+classification or aggregation; they are not application dependencies or
+authorization grants. Scheduling, missing-provider and cycle errors, bounded
+concurrency, deadlines, and `OpDef` execution belong to the runtime which
+consumes them.
 
 ## Native routing
 

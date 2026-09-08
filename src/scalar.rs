@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::{fmt, str::FromStr};
 
 use async_hash::{Digest, Hash, Output};
@@ -40,36 +40,27 @@ impl Scalar {
         }
     }
 
-    /// Return the methods invoked on concrete links in this scalar.
+    /// Visit each method invoked on a concrete link in this scalar.
     ///
-    /// This reports only the IR fact. Runtime owners decide whether a link names
-    /// an application, a native resource, or an external host.
-    pub fn referenced_methods(&self) -> BTreeMap<Link, BTreeSet<crate::Method>> {
-        let mut references = BTreeMap::new();
-        self.collect_referenced_methods(&mut references);
-        references
-    }
-
-    pub(crate) fn collect_referenced_methods(
-        &self,
-        references: &mut BTreeMap<Link, BTreeSet<crate::Method>>,
-    ) {
+    /// This reports syntax only. The caller owns classification, aggregation,
+    /// ordering, and policy.
+    pub fn visit_referenced_methods(&self, visitor: &mut impl FnMut(&Link, crate::Method)) {
         match self {
             Self::Value(_) => {}
-            Self::Ref(reference) => reference.collect_referenced_methods(references),
+            Self::Ref(reference) => reference.visit_referenced_methods(visitor),
             Self::Op(op) => {
                 for (_, scalar) in op.form() {
-                    scalar.collect_referenced_methods(references);
+                    scalar.visit_referenced_methods(visitor);
                 }
             }
             Self::Map(map) => {
                 for scalar in map.values() {
-                    scalar.collect_referenced_methods(references);
+                    scalar.visit_referenced_methods(visitor);
                 }
             }
             Self::Tuple(tuple) => {
                 for scalar in tuple {
-                    scalar.collect_referenced_methods(references);
+                    scalar.visit_referenced_methods(visitor);
                 }
             }
         }

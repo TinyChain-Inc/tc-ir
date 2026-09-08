@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use crate::{Id, Map, Method, Scalar, Subject};
@@ -171,33 +171,33 @@ impl OpRef {
         ids
     }
 
-    pub(crate) fn collect_referenced_methods(
+    pub(crate) fn visit_referenced_methods(
         &self,
-        references: &mut BTreeMap<pathlink::Link, BTreeSet<Method>>,
+        visitor: &mut impl FnMut(&pathlink::Link, Method),
     ) {
         let (method, subject) = match self {
             Self::Get((subject, key)) => {
-                key.collect_referenced_methods(references);
+                key.visit_referenced_methods(visitor);
                 (Method::Get, subject)
             }
             Self::Put((subject, key, value)) => {
-                key.collect_referenced_methods(references);
-                value.collect_referenced_methods(references);
+                key.visit_referenced_methods(visitor);
+                value.visit_referenced_methods(visitor);
                 (Method::Put, subject)
             }
             Self::Post((subject, params)) => {
                 for scalar in params.values() {
-                    scalar.collect_referenced_methods(references);
+                    scalar.visit_referenced_methods(visitor);
                 }
                 (Method::Post, subject)
             }
             Self::Delete((subject, key)) => {
-                key.collect_referenced_methods(references);
+                key.visit_referenced_methods(visitor);
                 (Method::Delete, subject)
             }
         };
         if let Subject::Link(link) = subject {
-            references.entry(link.clone()).or_default().insert(method);
+            visitor(link, method);
         }
     }
 }
