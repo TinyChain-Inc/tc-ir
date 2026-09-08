@@ -74,10 +74,12 @@ ready set observes an immutable snapshot of prior results.
 
 ## Native routing
 
-`Route<State>` resolves a suffix to one `Handler<State>`. `Handler<State>`
-exposes GET, PUT, POST, and DELETE over native values and an explicit
-transaction capability; unsupported verbs use its default structured error.
-`Public<State>` is the shared route-and-invoke helper.
+`Route<State>` resolves a suffix to one `Handler<State>`. A handler
+synchronously selects an optional GET, PUT, POST, or DELETE closure; only that
+selected closure erases its asynchronous future. An absent closure is the
+structured unsupported-verb result. `Public<State>` is the shared
+route-and-invoke helper. There is no second call enum carrying a method and its
+arguments.
 
 `Transaction` is a native capability, not a serializable header. Real wire
 boundaries carry the canonical `TxnId` through their protocol-defined channel;
@@ -86,9 +88,10 @@ mirror transaction identity, time, or claims in an IR envelope.
 
 Handlers never receive codecs, HTTP bodies, Python objects, WASM memory, or host
 storage. Native composition passes `State` directly. Serialization occurs only
-at a transport, persistence, sandbox, or foreign-runtime boundary. `Arc<H>`
-delegates `Handler<State>` for heterogeneous recursive routing without a second
-dispatch enum.
+at a transport, persistence, sandbox, or foreign-runtime boundary. The concrete
+route owner constructs its handler directly. Blanket smart-pointer
+or reference implementations are prohibited because they obscure the owning
+route and duplicate delegation.
 
 ## Hashing and codecs
 

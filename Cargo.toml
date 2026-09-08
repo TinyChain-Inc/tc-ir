@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 async-hash = { path = "../deps/async-hash", version = "0.6" }
-async-trait = "0.1"
 destream = { path = "../deps/destream", version = "0.10" }
 hr-id = { path = "../deps/hr-id", version = "0.7", features = ["hash", "stream"] }
 safecast = "0.2"

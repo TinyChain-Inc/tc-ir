@@ -1,7 +1,6 @@
 use std::future::Future;
-use std::sync::Arc;
+use std::pin::Pin;
 
-use async_trait::async_trait;
 use pathlink::PathSegment;
 use tc_error::{TCError, TCResult};
 
@@ -14,62 +13,6 @@ pub enum Method {
     Put,
     Post,
     Delete,
-}
-
-/// One native method invocation, shared by inbound and nested dispatch.
-pub enum MethodCall<State> {
-    Get(Scalar),
-    Put(Scalar, State),
-    Post(Map<State>),
-    Delete(Scalar),
-}
-
-impl<State> MethodCall<State> {
-    pub fn method(&self) -> Method {
-        match self {
-            Self::Get(_) => Method::Get,
-            Self::Put(_, _) => Method::Put,
-            Self::Post(_) => Method::Post,
-            Self::Delete(_) => Method::Delete,
-        }
-    }
-
-    pub fn into_request(self) -> (Method, Option<State>)
-    where
-        State: From<Scalar> + From<Vec<State>> + From<Map<State>>,
-    {
-        match self {
-            Self::Get(key) => (Method::Get, Some(State::from(key))),
-            Self::Put(key, value) => (
-                Method::Put,
-                Some(State::from(vec![State::from(key), value])),
-            ),
-            Self::Post(params) => (Method::Post, Some(State::from(params))),
-            Self::Delete(key) => (Method::Delete, Some(State::from(key))),
-        }
-    }
-
-    pub async fn invoke(
-        self,
-        handler: &dyn Handler<State>,
-        txn: &State::Transaction,
-    ) -> TCResult<State>
-    where
-        State: StateInstance + Default,
-    {
-        match self {
-            Self::Get(key) => handler.get(txn, key).await,
-            Self::Put(key, value) => {
-                handler.put(txn, key, value).await?;
-                Ok(State::default())
-            }
-            Self::Post(params) => handler.post(txn, params).await,
-            Self::Delete(key) => {
-                handler.delete(txn, key).await?;
-                Ok(State::default())
-            }
-        }
-    }
 }
 
 impl Method {
@@ -103,97 +46,69 @@ impl std::str::FromStr for Method {
     }
 }
 
-/// IR analogue of `tc-transact`'s `Route` trait.
-pub trait Route<State: StateInstance>: Send + Sync {
-    /// Resolve the handler mounted at the given path.
-    fn route(&self, path: &[PathSegment]) -> Option<Box<dyn Handler<State> + '_>>;
-}
-
 /// The minimal native state capability required by routing.
 pub trait StateInstance: Clone + Send + 'static {
     type Transaction: Transaction;
 }
 
-/// A native route handler. Methods exchange state directly and know nothing
-/// about views, serialization, or transport representations.
-#[async_trait]
-pub trait Handler<State>: Send + Sync
-where
-    State: StateInstance,
-{
-    async fn get(&self, _txn: &State::Transaction, _key: Scalar) -> TCResult<State> {
-        Err(TCError::method_not_allowed(
-            Method::Get,
-            std::any::type_name::<Self>(),
-        ))
+/// The erased future returned by one selected native verb.
+pub type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = TCResult<T>> + Send + 'a>>;
+
+pub type GetHandler<'a, 'txn, State> = Box<
+    dyn FnOnce(&'txn <State as StateInstance>::Transaction, Scalar) -> HandlerFuture<'a, State>
+        + Send
+        + 'a,
+>;
+pub type PutHandler<'a, 'txn, State> = Box<
+    dyn FnOnce(&'txn <State as StateInstance>::Transaction, Scalar, State) -> HandlerFuture<'a, ()>
+        + Send
+        + 'a,
+>;
+pub type PostHandler<'a, 'txn, State> = Box<
+    dyn FnOnce(&'txn <State as StateInstance>::Transaction, Map<State>) -> HandlerFuture<'a, State>
+        + Send
+        + 'a,
+>;
+pub type DeleteHandler<'a, 'txn, State> = Box<
+    dyn FnOnce(&'txn <State as StateInstance>::Transaction, Scalar) -> HandlerFuture<'a, ()>
+        + Send
+        + 'a,
+>;
+
+/// A routed native handler. Each implementation exposes only the verbs it owns.
+pub trait Handler<'a, State: StateInstance>: Send {
+    fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        None
     }
 
-    async fn put(&self, _txn: &State::Transaction, _key: Scalar, _value: State) -> TCResult<()> {
-        Err(TCError::method_not_allowed(
-            Method::Put,
-            std::any::type_name::<Self>(),
-        ))
+    fn put<'txn>(self: Box<Self>) -> Option<PutHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        None
     }
 
-    async fn post(&self, _txn: &State::Transaction, _params: Map<State>) -> TCResult<State> {
-        Err(TCError::method_not_allowed(
-            Method::Post,
-            std::any::type_name::<Self>(),
-        ))
+    fn post<'txn>(self: Box<Self>) -> Option<PostHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        None
     }
 
-    async fn delete(&self, _txn: &State::Transaction, _key: Scalar) -> TCResult<()> {
-        Err(TCError::method_not_allowed(
-            Method::Delete,
-            std::any::type_name::<Self>(),
-        ))
+    fn delete<'txn>(self: Box<Self>) -> Option<DeleteHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        None
     }
 }
 
-#[async_trait]
-impl<State, H> Handler<State> for Arc<H>
-where
-    State: StateInstance,
-    H: Handler<State> + ?Sized,
-{
-    async fn get(&self, txn: &State::Transaction, key: Scalar) -> TCResult<State> {
-        (**self).get(txn, key).await
-    }
-
-    async fn put(&self, txn: &State::Transaction, key: Scalar, value: State) -> TCResult<()> {
-        (**self).put(txn, key, value).await
-    }
-
-    async fn post(&self, txn: &State::Transaction, params: Map<State>) -> TCResult<State> {
-        (**self).post(txn, params).await
-    }
-
-    async fn delete(&self, txn: &State::Transaction, key: Scalar) -> TCResult<()> {
-        (**self).delete(txn, key).await
-    }
-}
-
-#[async_trait]
-impl<State, H> Handler<State> for &H
-where
-    State: StateInstance,
-    H: Handler<State> + ?Sized,
-{
-    async fn get(&self, txn: &State::Transaction, key: Scalar) -> TCResult<State> {
-        (**self).get(txn, key).await
-    }
-
-    async fn put(&self, txn: &State::Transaction, key: Scalar, value: State) -> TCResult<()> {
-        (**self).put(txn, key, value).await
-    }
-
-    async fn post(&self, txn: &State::Transaction, params: Map<State>) -> TCResult<State> {
-        (**self).post(txn, params).await
-    }
-
-    async fn delete(&self, txn: &State::Transaction, key: Scalar) -> TCResult<()> {
-        (**self).delete(txn, key).await
-    }
+/// Resolve the most-specific handler mounted at a structural path.
+pub trait Route<State: StateInstance>: Send + Sync {
+    fn route<'a>(&'a self, path: &[PathSegment]) -> Option<Box<dyn Handler<'a, State> + 'a>>;
 }
 
 /// Uniform native method dispatch for every routed value.
@@ -201,60 +116,72 @@ pub trait Public<State>: Route<State>
 where
     State: StateInstance,
 {
-    fn get(
-        &self,
-        txn: &State::Transaction,
+    fn get<'a>(
+        &'a self,
+        txn: &'a State::Transaction,
         path: &[PathSegment],
         key: Scalar,
-    ) -> impl Future<Output = TCResult<State>> + Send {
+    ) -> impl Future<Output = TCResult<State>> + Send + 'a {
+        let handler = self.route(path);
+        let path = path_string(path);
         async move {
-            self.route(path)
-                .ok_or_else(|| TCError::not_found(path_string(path)))?
-                .get(txn, key)
-                .await
+            let handler = handler.ok_or_else(|| TCError::not_found(path.clone()))?;
+            let handler = handler
+                .get()
+                .ok_or_else(|| TCError::method_not_allowed(Method::Get, path))?;
+            handler(txn, key).await
         }
     }
 
-    fn put(
-        &self,
-        txn: &State::Transaction,
+    fn put<'a>(
+        &'a self,
+        txn: &'a State::Transaction,
         path: &[PathSegment],
         key: Scalar,
         value: State,
-    ) -> impl Future<Output = TCResult<()>> + Send {
+    ) -> impl Future<Output = TCResult<()>> + Send + 'a {
+        let handler = self.route(path);
+        let path = path_string(path);
         async move {
-            self.route(path)
-                .ok_or_else(|| TCError::not_found(path_string(path)))?
-                .put(txn, key, value)
-                .await
+            let handler = handler.ok_or_else(|| TCError::not_found(path.clone()))?;
+            let handler = handler
+                .put()
+                .ok_or_else(|| TCError::method_not_allowed(Method::Put, path))?;
+            handler(txn, key, value).await
         }
     }
 
-    fn post(
-        &self,
-        txn: &State::Transaction,
+    fn post<'a>(
+        &'a self,
+        txn: &'a State::Transaction,
         path: &[PathSegment],
         params: Map<State>,
-    ) -> impl Future<Output = TCResult<State>> + Send {
+    ) -> impl Future<Output = TCResult<State>> + Send + 'a {
+        let handler = self.route(path);
+        let path = path_string(path);
         async move {
-            self.route(path)
-                .ok_or_else(|| TCError::not_found(path_string(path)))?
-                .post(txn, params)
-                .await
+            let handler = handler.ok_or_else(|| TCError::not_found(path.clone()))?;
+            let handler = handler
+                .post()
+                .ok_or_else(|| TCError::method_not_allowed(Method::Post, path))?;
+            handler(txn, params).await
         }
     }
 
-    fn delete(
-        &self,
-        txn: &State::Transaction,
+    fn delete<'a>(
+        &'a self,
+        txn: &'a State::Transaction,
         path: &[PathSegment],
         key: Scalar,
-    ) -> impl Future<Output = TCResult<()>> + Send {
+    ) -> impl Future<Output = TCResult<()>> + Send + 'a {
+        let handler = self.route(path);
+        let path = path_string(path);
         async move {
-            self.route(path)
-                .ok_or_else(|| TCError::not_found(path_string(path)))?
-                .delete(txn, key)
-                .await
+            let handler = handler.ok_or_else(|| TCError::not_found(path.clone()))?;
+            let handler = handler
+                .delete()
+                .ok_or_else(|| TCError::method_not_allowed(Method::Delete, path))?;
+            handler(txn, key).await
         }
     }
 }

@@ -9,8 +9,8 @@ algebra and the small native contracts shared by runtimes.
   deferred computation.
 - `Transaction` and `Transact` describe protocol identity and resource
   lifecycle.
-- `MethodCall`, `Handler`, `Route`, and `Public` form the native verb and
-  routing boundary.
+- `Method`, `Handler`, `Route`, and `Public` form the native verb and routing
+  boundary. A handler exposes only its supported verb closures.
 - `IntoView` acquires a transaction-consistent native view independently of
   wire encoding.
 

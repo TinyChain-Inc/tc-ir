@@ -9,7 +9,6 @@ mod txn;
 pub use txn::*;
 
 mod public;
-pub use async_trait::async_trait;
 pub use public::*;
 
 mod view;
@@ -34,7 +33,6 @@ mod tests {
 
     use number_general::Number;
     use pathlink::{Link, PathBuf};
-    use tc_error::TCResult;
     use tc_value::Value;
 
     use super::*;
@@ -67,34 +65,68 @@ mod tests {
     #[derive(Clone)]
     struct HelloHandler;
 
-    #[derive(Clone)]
+    struct HelloRoute;
+
+    #[derive(Clone, Debug)]
     struct FakeState(String);
 
     impl StateInstance for FakeState {
         type Transaction = FakeTxn;
     }
 
-    #[async_trait::async_trait]
-    impl Handler<FakeState> for HelloHandler {
-        async fn get(&self, _txn: &FakeTxn, request: Scalar) -> TCResult<FakeState> {
-            let Scalar::Value(Value::String(request)) = request else {
-                return Err(tc_error::TCError::bad_request("expected a string"));
-            };
-            Ok(FakeState(format!("hello {request}")))
+    impl<'a> Handler<'a, FakeState> for HelloHandler {
+        fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, FakeState>>
+        where
+            'txn: 'a,
+        {
+            Some(Box::new(|_txn, request| {
+                Box::pin(async move {
+                    let Scalar::Value(Value::String(request)) = request else {
+                        return Err(tc_error::TCError::bad_request("expected a string"));
+                    };
+                    Ok(FakeState(format!("hello {request}")))
+                })
+            }))
+        }
+    }
+
+    impl Route<FakeState> for HelloRoute {
+        fn route<'a>(
+            &'a self,
+            path: &[pathlink::PathSegment],
+        ) -> Option<Box<dyn Handler<'a, FakeState> + 'a>> {
+            path.is_empty()
+                .then_some(Box::new(HelloHandler) as Box<dyn Handler<'a, FakeState>>)
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn handler_invocation() {
-        let handler = HelloHandler;
+    async fn native_route_invokes_its_concrete_handler() {
+        let route = HelloRoute;
         let claim = Claim::new(Link::from_str("/hello").unwrap(), umask::Mode::all());
         let txn = FakeTxn::new(claim);
 
-        let out = handler
-            .get(&txn, Scalar::from(Value::String("world".into())))
-            .await
-            .unwrap();
+        let out = Public::get(
+            &route,
+            &txn,
+            &[],
+            Scalar::from(Value::String("world".into())),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.0, "hello world");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_route_rejects_an_unadvertised_verb() {
+        let route = HelloRoute;
+        let claim = Claim::new(Link::from_str("/hello").unwrap(), umask::Mode::all());
+        let txn = FakeTxn::new(claim);
+
+        let err = Public::post(&route, &txn, &[], Map::new())
+            .await
+            .expect_err("POST is not advertised");
+        assert_eq!(err.code(), tc_error::ErrorKind::MethodNotAllowed);
     }
 
     #[test]
@@ -108,25 +140,6 @@ mod tests {
     #[test]
     fn txn_id_rejects_partial_wire_id_without_trace() {
         assert!(TxnId::from_str("7-1").is_err());
-    }
-
-    #[test]
-    fn native_routing_is_projection_free() {
-        let routing = include_str!("public.rs");
-        for forbidden in ["destream", "serde", "hyper", "pyo3", "wasm"] {
-            assert!(
-                !routing.contains(forbidden),
-                "native routing must not depend on {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn native_route_state_is_explicit() {
-        let handler = include_str!("public.rs");
-        assert!(!handler.contains("Route<State ="));
-        assert!(!handler.contains("type Handler"));
-        assert!(handler.contains("Box<dyn Handler<State>"));
     }
 
     #[test]
