@@ -1,23 +1,15 @@
 #![forbid(unsafe_code)]
 
-//! Core TinyChain IR traits, inspired by `tc-transact`'s `Handler` and `Route`
-//! abstractions.
-//!
-//! These definitions intentionally mirror the behavior of the existing
-//! `tc-transact` `Handler`/`Route` traits while staying agnostic to any
-//! particular runtime. They should be expressive enough to back WASM sandboxes,
-//! PyO3 bindings, or the existing Rust server stack without leaking lower-level
-//! implementation details.
+//! TinyChain's scalar and operation algebra, plus its shared transaction,
+//! routing, and view contracts.
 
 pub use hr_id::Id;
-pub use tc_value::class::{Class, NativeClass};
 
 mod txn;
 pub use txn::*;
 
-mod handler;
-pub use async_trait::async_trait;
-pub use handler::*;
+mod public;
+pub use public::*;
 
 mod view;
 pub use view::*;
@@ -34,20 +26,13 @@ pub use op::*;
 mod tcref;
 pub use tcref::*;
 
-mod dir;
-pub use dir::*;
-
-mod library;
-pub use library::*;
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::str::FromStr;
 
     use number_general::Number;
-    use pathlink::{Link, PathBuf, PathSegment};
-    use tc_error::TCResult;
+    use pathlink::{Link, PathBuf};
     use tc_value::Value;
 
     use super::*;
@@ -80,66 +65,68 @@ mod tests {
     #[derive(Clone)]
     struct HelloHandler;
 
-    #[derive(Clone)]
+    struct HelloRoute;
+
+    #[derive(Clone, Debug)]
     struct FakeState(String);
 
     impl StateInstance for FakeState {
         type Transaction = FakeTxn;
     }
 
-    #[async_trait::async_trait]
-    impl Handler<FakeState> for HelloHandler {
-        async fn get(&self, _txn: &FakeTxn, request: Scalar) -> TCResult<FakeState> {
-            let Scalar::Value(Value::String(request)) = request else {
-                return Err(tc_error::TCError::bad_request("expected a string"));
-            };
-            Ok(FakeState(format!("hello {request}")))
+    impl<'a> Handler<'a, FakeState> for HelloHandler {
+        fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, FakeState>>
+        where
+            'txn: 'a,
+        {
+            Some(Box::new(|_txn, request| {
+                Box::pin(async move {
+                    let Scalar::Value(Value::String(request)) = request else {
+                        return Err(tc_error::TCError::bad_request("expected a string"));
+                    };
+                    Ok(FakeState(format!("hello {request}")))
+                })
+            }))
+        }
+    }
+
+    impl Route<FakeState> for HelloRoute {
+        fn route<'a>(
+            &'a self,
+            path: &[pathlink::PathSegment],
+        ) -> Option<Box<dyn Handler<'a, FakeState> + 'a>> {
+            path.is_empty()
+                .then_some(Box::new(HelloHandler) as Box<dyn Handler<'a, FakeState>>)
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn handler_invocation() {
-        let handler = HelloHandler;
+    async fn native_route_invokes_its_concrete_handler() {
+        let route = HelloRoute;
         let claim = Claim::new(Link::from_str("/hello").unwrap(), umask::Mode::all());
         let txn = FakeTxn::new(claim);
 
-        let out = handler
-            .get(&txn, Scalar::from(Value::String("world".into())))
-            .await
-            .unwrap();
+        let out = Public::get(
+            &route,
+            &txn,
+            &[],
+            Scalar::from(Value::String("world".into())),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.0, "hello world");
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn library_schema_destream_roundtrip() {
-        let schema = LibrarySchema::new(
-            Link::from_str("/lib/service").expect("link"),
-            "0.1.0",
-            vec![
-                Link::from_str("/lib/dependency").expect("dep"),
-                Link::from_str("/lib/other").expect("dep"),
-            ],
-        );
+    async fn native_route_rejects_an_unadvertised_verb() {
+        let route = HelloRoute;
+        let claim = Claim::new(Link::from_str("/hello").unwrap(), umask::Mode::all());
+        let txn = FakeTxn::new(claim);
 
-        let encoded = destream_json::encode(schema.clone()).expect("encode schema");
-        let decoded: LibrarySchema = destream_json::try_decode((), encoded)
+        let err = Public::post(&route, &txn, &[], Map::new())
             .await
-            .expect("decode schema");
-
-        assert_eq!(decoded, schema);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn txn_header_destream_roundtrip() {
-        let claim = Claim::new(Link::from_str("/lib/service").unwrap(), umask::Mode::all());
-        let header = TxnHeader::from_transaction(&FakeTxn::new(claim));
-
-        let encoded = destream_json::encode(header.clone()).expect("encode header");
-        let decoded: TxnHeader = destream_json::try_decode((), encoded)
-            .await
-            .expect("decode header");
-
-        assert_eq!(decoded, header);
+            .expect_err("POST is not advertised");
+        assert_eq!(err.code(), tc_error::ErrorKind::MethodNotAllowed);
     }
 
     #[test]
@@ -155,30 +142,21 @@ mod tests {
         assert!(TxnId::from_str("7-1").is_err());
     }
 
-    fn segment(name: &str) -> PathSegment {
-        PathSegment::from_str(name).expect("path segment")
-    }
-
     #[test]
-    fn native_routing_is_projection_free() {
-        let routing = include_str!("handler.rs");
-        for forbidden in ["destream", "serde", "hyper", "pyo3", "wasm"] {
-            assert!(
-                !routing.contains(forbidden),
-                "native routing must not depend on {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn native_route_state_is_explicit() {
-        let handler = include_str!("handler.rs");
-        assert!(!handler.contains("Route<State ="));
-        assert!(!handler.contains("type Handler"));
-        assert!(handler.contains("Box<dyn Handler<State>"));
-
-        let library = include_str!("library.rs");
-        assert!(!library.contains("Routes: Route"));
+    fn scalar_async_hash_is_deterministic() {
+        let scalar = Scalar::Map(Map::from_iter([
+            ("a".parse().unwrap(), Scalar::from(7_u64)),
+            ("b".parse().unwrap(), Scalar::from(Value::from("tinychain"))),
+        ]));
+        let digest = async_hash::Hash::<async_hash::Sha256>::hash(&scalar);
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            digest,
+            "d0399510942f294e3d0df854af9cd024758ef600f0fb5b84ce63b6367866b918"
+        );
     }
 
     #[test]
@@ -189,53 +167,6 @@ mod tests {
             assert!(!source.contains(&legacy_symbol));
             assert!(!source.contains(&legacy_path));
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn dir_routes_nested_handler() {
-        let path = vec![segment("library"), segment("status")];
-        let dir = Dir::from_routes(vec![(path.clone(), HelloHandler)]).expect("dir");
-
-        let claim = Claim::new(Link::from_str("/lib").unwrap(), umask::Mode::all());
-        let txn = FakeTxn::new(claim);
-
-        let handler = dir.route(&path).expect("handler resolved");
-        let out = handler
-            .get(&txn, Scalar::from(Value::String("tinychain".to_string())))
-            .await
-            .expect("GET");
-        assert_eq!(out.0, "hello tinychain");
-    }
-
-    #[test]
-    fn dir_detects_conflicts() {
-        let path = vec![segment("library"), segment("status")];
-
-        match Dir::from_routes(vec![
-            (path.clone(), HelloHandler),
-            (path.clone(), HelloHandler),
-        ]) {
-            Ok(_) => panic!("expected conflict inserting duplicate handler"),
-            Err(err) => assert!(err.message().contains("already mounted")),
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn macro_builds_routes() {
-        let dir = tc_library_routes! {
-            "/lib/status" => HelloHandler,
-        }
-        .expect("macro routes");
-
-        let claim = Claim::new(Link::from_str("/lib").unwrap(), umask::Mode::all());
-        let txn = FakeTxn::new(claim);
-        let path = [segment("lib"), segment("status")];
-        let handler = dir.route(&path).expect("handler");
-        let out = handler
-            .get(&txn, Scalar::from(Value::String("macro".to_string())))
-            .await
-            .expect("GET");
-        assert_eq!(out.0, "hello macro");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -262,6 +193,19 @@ mod tests {
             .expect("decode scalar map");
 
         assert_eq!(decoded, scalar);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scalar_maps_reject_duplicate_input_names() {
+        use bytes::Bytes;
+        use futures::{future, stream};
+
+        let source = stream::once(future::ready(Ok::<_, std::convert::Infallible>(
+            Bytes::from_static(br#"{"input":1,"input":2}"#),
+        )));
+        let decoded: Result<Scalar, _> = destream_json::try_decode((), source).await;
+        let error = decoded.expect_err("reject duplicate input name");
+        assert!(error.to_string().contains("duplicate map key input"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -401,28 +345,10 @@ mod tests {
     }
 
     #[test]
-    fn library_module_wraps_schema_and_routes() {
-        let schema = LibrarySchema::new(Link::from_str("/lib/service").unwrap(), "1.0.0", vec![]);
-        let routes = tc_library_routes! {
-            "/lib/status" => HelloHandler,
-        }
-        .expect("routes");
-
-        let lib: LibraryModule<FakeState, _> = LibraryModule::new(schema.clone(), routes);
-        assert_eq!(lib.schema(), &schema);
-        let path = [segment("lib"), segment("status")];
-        assert!(lib.routes().route(&path).is_some());
-    }
-
-    #[test]
-    fn map_require_optional() {
+    fn map_require() {
         let mut map: Map<u64> = Map::new();
         map.insert("answer".parse().expect("Id"), 42);
 
-        assert_eq!(map.optional("missing").expect("optional"), None);
-        assert_eq!(map.optional("answer").expect("optional"), Some(42));
-
-        map.insert("answer".parse().expect("Id"), 42);
         assert_eq!(map.require("answer").expect("require"), 42);
         assert!(map.is_empty());
 

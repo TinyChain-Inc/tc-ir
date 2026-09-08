@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
 use std::{fmt, str::FromStr};
 
+use async_hash::{Digest, Hash, Output};
 use destream::{de, en, IntoStream};
 use number_general::Number;
 use pathlink::{path_label, Link, PathBuf, PathLabel};
-use tc_error::TCError;
+use tc_error::{TCError, TCResult};
 use tc_value::{decode_typed_value_map_entry, Value};
 
 use crate::{Id, Map};
@@ -25,6 +27,94 @@ pub enum Scalar {
     Op(crate::op::OpDef),
     Map(Map<Scalar>),
     Tuple(Vec<Scalar>),
+}
+
+impl Scalar {
+    /// Add the lexical bindings required to resolve this scalar.
+    ///
+    /// This is a syntactic query. It neither resolves nor mutates a runtime
+    /// namespace; the caller owns the request-local accumulator.
+    pub fn requires(&self, required: &mut BTreeSet<Id>) {
+        match self {
+            Self::Value(_) => {}
+            Self::Ref(reference) => reference.requires(required),
+            Self::Op(op) => op.requires(required),
+            Self::Map(map) => {
+                for scalar in map.values() {
+                    scalar.requires(required);
+                }
+            }
+            Self::Tuple(tuple) => {
+                for scalar in tuple {
+                    scalar.requires(required);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn validate_scope(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
+        match self {
+            Self::Value(_) => Ok(()),
+            Self::Ref(reference) => reference.validate_scope(visible),
+            Self::Op(op) => op.validate_with_visible(visible),
+            Self::Map(map) => {
+                for scalar in map.values() {
+                    scalar.validate_scope(visible)?;
+                }
+                Ok(())
+            }
+            Self::Tuple(tuple) => {
+                for scalar in tuple {
+                    scalar.validate_scope(visible)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Visit each method invoked on a concrete link in this scalar.
+    ///
+    /// This reports syntax only. The caller owns classification, aggregation,
+    /// ordering, and policy.
+    pub fn visit_referenced_methods(&self, visitor: &mut impl FnMut(&Link, crate::Method)) {
+        match self {
+            Self::Value(_) => {}
+            Self::Ref(reference) => reference.visit_referenced_methods(visitor),
+            Self::Op(op) => {
+                for (_, scalar) in op.form() {
+                    scalar.visit_referenced_methods(visitor);
+                }
+            }
+            Self::Map(map) => {
+                for scalar in map.values() {
+                    scalar.visit_referenced_methods(visitor);
+                }
+            }
+            Self::Tuple(tuple) => {
+                for scalar in tuple {
+                    scalar.visit_referenced_methods(visitor);
+                }
+            }
+        }
+    }
+}
+
+impl<D: Digest> Hash<D> for Scalar {
+    fn hash(self) -> Output<D> {
+        Hash::<D>::hash(&self)
+    }
+}
+
+impl<D: Digest> Hash<D> for &Scalar {
+    fn hash(self) -> Output<D> {
+        match self {
+            Scalar::Value(value) => Hash::<D>::hash(value),
+            Scalar::Ref(reference) => Hash::<D>::hash(reference.as_ref()),
+            Scalar::Op(op) => Hash::<D>::hash(op),
+            Scalar::Map(map) => Hash::<D>::hash(map),
+            Scalar::Tuple(tuple) => Hash::<D>::hash(tuple),
+        }
+    }
 }
 
 /// A reference to a named value in a scope (e.g. "$self").
@@ -89,8 +179,6 @@ pub enum Subject {
 pub const SCALAR_REF_PREFIX: PathLabel = path_label(&["state", "scalar", "ref"]);
 pub const OPREF_PREFIX: PathLabel = path_label(&["state", "scalar", "ref", "op"]);
 pub const OPDEF_PREFIX: PathLabel = path_label(&["state", "scalar", "op"]);
-pub const OPDEF_REFLECT_PREFIX: PathLabel = path_label(&["state", "scalar", "op", "reflect"]);
-pub const SCALAR_REFLECT_PREFIX: PathLabel = path_label(&["state", "scalar", "reflect"]);
 pub const SCALAR_MAP: PathLabel = path_label(&["state", "scalar", "map"]);
 pub const SCALAR_TUPLE: PathLabel = path_label(&["state", "scalar", "tuple"]);
 pub const OPREF_GET: PathLabel = path_label(&["state", "scalar", "ref", "op", "get"]);
@@ -105,14 +193,6 @@ pub const OPDEF_GET: PathLabel = path_label(&["state", "scalar", "op", "get"]);
 pub const OPDEF_PUT: PathLabel = path_label(&["state", "scalar", "op", "put"]);
 pub const OPDEF_POST: PathLabel = path_label(&["state", "scalar", "op", "post"]);
 pub const OPDEF_DELETE: PathLabel = path_label(&["state", "scalar", "op", "delete"]);
-pub const SCALAR_REFLECT_CLASS: PathLabel = path_label(&["state", "scalar", "reflect", "class"]);
-pub const SCALAR_REFLECT_REF_PARTS: PathLabel =
-    path_label(&["state", "scalar", "reflect", "ref_parts"]);
-pub const OPDEF_REFLECT_FORM: PathLabel = path_label(&["state", "scalar", "op", "reflect", "form"]);
-pub const OPDEF_REFLECT_LAST_ID: PathLabel =
-    path_label(&["state", "scalar", "op", "reflect", "last_id"]);
-pub const OPDEF_REFLECT_SCALARS: PathLabel =
-    path_label(&["state", "scalar", "op", "reflect", "scalars"]);
 
 impl de::FromStream for IdRef {
     type Context = ();
@@ -151,6 +231,18 @@ impl fmt::Display for Subject {
             Subject::Ref(id, path) if path.is_empty() => fmt::Display::fmt(id, f),
             Subject::Ref(id, path) => write!(f, "{id}{path}"),
         }
+    }
+}
+
+impl<D: Digest> Hash<D> for &IdRef {
+    fn hash(self) -> Output<D> {
+        Hash::<D>::hash(&self.0)
+    }
+}
+
+impl<D: Digest> Hash<D> for &Subject {
+    fn hash(self) -> Output<D> {
+        Hash::<D>::hash(self.to_string())
     }
 }
 
@@ -306,7 +398,9 @@ impl de::FromStream for Scalar {
                     let id: Id = key
                         .parse::<Id>()
                         .map_err(|err| de::Error::custom(err.to_string()))?;
-                    out.insert(id, value);
+                    if out.insert(id.clone(), value).is_some() {
+                        return Err(de::Error::custom(format!("duplicate map key {id}")));
+                    }
                 }
 
                 Ok(Scalar::Map(out))
@@ -392,53 +486,6 @@ impl From<crate::op::OpDef> for Scalar {
 impl From<u64> for Scalar {
     fn from(value: u64) -> Self {
         Scalar::Value(Value::from(value))
-    }
-}
-
-impl Scalar {
-    pub fn walk(&self) -> ScalarWalk<'_> {
-        ScalarWalk::new(self)
-    }
-
-    pub fn walk_tcref(&self) -> impl Iterator<Item = &crate::tcref::TCRef> {
-        self.walk().filter_map(|scalar| match scalar {
-            Scalar::Ref(r) => Some(r.as_ref()),
-            _ => None,
-        })
-    }
-}
-
-pub struct ScalarWalk<'a> {
-    stack: Vec<&'a Scalar>,
-}
-
-impl<'a> ScalarWalk<'a> {
-    pub(crate) fn new(root: &'a Scalar) -> Self {
-        Self { stack: vec![root] }
-    }
-}
-
-impl<'a> Iterator for ScalarWalk<'a> {
-    type Item = &'a Scalar;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let next = self.stack.pop()?;
-
-        match next {
-            Scalar::Map(map) => {
-                for value in map.values().rev() {
-                    self.stack.push(value);
-                }
-            }
-            Scalar::Tuple(items) => {
-                for value in items.iter().rev() {
-                    self.stack.push(value);
-                }
-            }
-            _ => {}
-        }
-
-        Some(next)
     }
 }
 

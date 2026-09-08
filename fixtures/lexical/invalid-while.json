@@ -1,0 +1,1 @@
+{"/state/scalar/op/post":[["state",1],["result",{"/state/scalar/ref/while":[{"/state/scalar/op/post":[["condition",{"$state":[]}]]},{"/state/scalar/op/post":[["next",{"$state":[]}]]},0]}]]}

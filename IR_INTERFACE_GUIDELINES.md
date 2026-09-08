@@ -1,93 +1,131 @@
-# TinyChain IR Access Guidelines
+# TinyChain IR interface guidelines
 
-These guidelines describe the interaction patterns TinyChain IR must support so multiple bindings (WASM, PyO3, etc.) can share consistent semantics. Detailed trait definitions and signatures will be specified later.
+This is the sole normative contract for `tc-ir`. The crate owns transport-neutral
+syntax and the minimal invocation and lifecycle interfaces shared by native
+runtimes. Application, storage, execution, authorization, and transport policy
+belongs downstream.
 
-## Interaction patterns
+## Ownership
 
-- **Stateless operations:** Support simple request/response logic that reads transactional state without mutating it.
-- **Stateful operations:** Allow methods that mutate collections or resources while holding an exclusive transactional lock.
-- **Asynchronous tasks:** Provide a way to run longer-lived or IO-bound work under scheduler control, with explicit cancellation and retry semantics.
-- **Per-method registration:** Each handler declares its HTTP verb/path support at compile time via dedicated `get/put/post/delete` methods. The default implementations return `Err(TCError::method_not_allowed(..))`, so handlers only override the verbs they support while routers get structured errors for unsupported verbs.
-- **Typed inputs/outputs:** Handler impls should operate on concrete Rust types; the L0 runtime (e.g. `tc-server`) is responsible for deserializing ingress requests into those types and serializing responses back to `State`/`Value` at the boundary, so handler graphs stay fully typed internally.
-- **Zero-cost sync support:** Even though handlers use async-friendly futures (GATs), a purely synchronous handler can set `type Fut<'a> = core::future::Ready<Result<...>>` (or another concrete future) and return `future::ready(...)`, avoiding heap allocations entirely. Reserve boxed futures for handlers that truly need dynamic dispatch.
-- **Reusable handler instances:** Handlers are expected to be long-lived structs registered at compile time. Once constructed, they should be callable many times (even inside tight loops) without cloning or rerouting through HTTP-style dispatch. Compose ops by invoking handlers/functions directly with their typed inputs rather than re-routing to `/state/<collection>/add` on each iteration.
-- **Method-not-supported signaling:** The per-verb methods return a `TCResult`; the default implementations yield `TCError::method_not_allowed`, so handler implementations only override the verbs they actually serve.
+| Concern | Owner |
+| --- | --- |
+| Scalar, reference, and operation representation | `tc-ir` |
+| Intrinsic syntactic queries and structural hashing | `tc-ir` |
+| Shared routing, invocation, view, and transaction interfaces | `tc-ir` |
+| Universal State interpretation, native routing, and Classes | `tc-state` |
+| Application grammar, installation, dependency policy, digests, and graph scheduling | `tc-server` |
 
-### Library helpers
+## Algebra
 
-- Use `tc_ir::LibraryModule` to bundle a `LibrarySchema` with a reusable routing table. It implements `Library` directly, so runtimes can return it from factory methods without extra boilerplate.
-- Build route tables with the `tc_library_routes!` macro. It accepts string paths (e.g., `"/hello/world"`) and produces a validated `Dir` so you don’t have to manage `PathSegment` vectors manually.
-- Bind route tables to the kernel-provided transaction context at the adapter
-  boundary. Do not define a local transaction implementation in a library or
-  example merely to invoke a handler.
+`Scalar`, `TCRef`, `OpRef`, and `OpDef` are the canonical graph vocabulary.
+Maps and tuples compose these forms recursively. Control flow is expressed by
+ordinary `TCRef` variants; no adapter or application-specific scalar variant is
+permitted.
 
-## Context requirements
+Lexical-requirement discovery and referenced-method visitation are intrinsic
+recursive queries on these owning values. `requires` reports identifiers used
+but not bound by the inspected form; it neither creates nor mutates a runtime
+namespace and is not an execution plan. The reference visitor reports
+individual Link/verb occurrences without classification or aggregation; they
+are not application dependencies or authorization grants. Scheduling,
+missing-provider and cycle errors, bounded concurrency, deadlines, and `OpDef`
+execution belong to the runtime which consumes them.
 
-Every IR invocation should implicitly receive at least:
+## Lexical scope
 
-- A transactional guard to allow ordering.
-- The set of permissions/capability bits granted to the caller.
-- The latest deterministic host health snapshot applicable to the shard.
+An `OpDef` is an immutable, single-assignment lexical graph. Invocation inputs
+and an optional bound `$self` form its outer frame; form entries are immutable
+providers. Every provider is visible throughout its form, so forward references
+are valid. Resolution never escapes this frame into an application, filesystem,
+process-global, or mutable namespace.
 
-Bindings should hide these details from user code but must honor them under the hood.
+| Form | Bindings introduced |
+| --- | --- |
+| GET | key parameter |
+| PUT | key and value parameters |
+| POST | request-map entries supplied at invocation |
+| DELETE | key parameter |
+| Form entry | one provider, visible throughout that form |
+| `ForEach` | `item_name`, visible only in its body |
+| `While` | reserved `$state`, visible only in its condition and body |
+| `Cond`, `After` | none |
 
-## Determinism & purity guidelines
+`$self` is reserved and exists only for bound execution. Explicit parameter,
+provider, and control-binder names must be unique across every visible enclosing
+scope: rebinding and shadowing are invalid. Sibling scopes do not see one
+another's private bindings. Client compilers may generate deterministic unique
+temporary names, but only before emitting IR; generated names obey the same IR
+rules afterward.
 
-- Handlers may not rely on local wall-clock time; they should use transaction-provided timestamps.
-- Inputs and outputs must be serializable with a `destream`.
+Nested operations may capture visible enclosing bindings. Standalone operations
+may retain unresolved captures for a later invocation context. `requires(&mut
+BTreeSet<Id>)` adds only syntactically referenced names not bound by the inspected
+form. Mutating this caller-owned accumulator is dependency collection, not
+namespace mutation. `ForEach` subtracts its item binding from body requirements;
+`While` subtracts `$state` from its callbacks while retaining requirements of
+its initial-state expression.
 
-## Execution ordering model
+At POST invocation, every required input must be present. Generic IR permits
+additional request-map entries because a concrete handler may intentionally
+accept them; an owning handler may impose a stricter schema. Before scheduling,
+the executor rejects duplicate inputs, duplicate providers, input/provider
+overlap, missing names, and cycles. Each resolved ID is cached once, and each
+ready set observes an immutable snapshot of prior results.
 
-- TinyChain executes by dataflow dependency, not by lexical/source order.
-- Independent nodes may execute concurrently when they have no dependency edge.
-- A dependency edge exists when one node consumes another node's output, or when
-  the graph includes an explicit ordering reference.
+## Native routing
 
-For side effects, ordering must be explicit. Bindings and compilers must not infer
-or synthesize side-effect sequencing from statement order. Developers must add an
-explicit `After` reference whenever two side-effecting operations require order
-and no natural data dependency already enforces it.
+`Route<State>` resolves a suffix to one `Handler<State>`. A handler
+synchronously selects an optional GET, PUT, POST, or DELETE closure; only that
+selected closure erases its asynchronous future. An absent closure is the
+structured unsupported-verb result. `Public<State>` is the shared
+route-and-invoke helper. There is no second call enum carrying a method and its
+arguments.
 
-## Op-graph payloads
+`Public` calls `Route::route` exactly once for the selected verb invocation.
+After routing selects a `Handler`, that handler is terminal for the current
+request: its verb closure executes the operation or delegates directly to an
+already-selected leaf closure, but must not route the same path again. Recursive
+namespace traversal belongs in `Route`. A genuinely new nested invocation uses
+the runtime executor so its target, transaction scope, and authorization are
+preserved.
 
-TinyChain v2 supports a transport-neutral op-graph payload intended to make workloads **inspectable**
-as data (deterministic DAG + fixed-count `Repeat`), so libraries/services can perform static analysis
-(metrics, conservative bounds, safety checks) without baking policy (billing, pricing, risk) into the IR.
+`Transaction` is a native capability, not a serializable header. Real wire
+boundaries carry the canonical `TxnId` through their protocol-defined channel;
+authorization stays in that boundary's authenticated claim mechanism. Do not
+mirror transaction identity, time, or claims in an IR envelope.
 
-The proposed payload and its design constraints live in `tc-ir/OP_GRAPH_IR.md`.
+Handlers never receive codecs, HTTP bodies, Python objects, WASM memory, or host
+storage. Native composition passes `State` directly. Serialization occurs only
+at a transport, persistence, sandbox, or foreign-runtime boundary. The concrete
+route owner constructs its handler directly. Blanket smart-pointer
+or reference implementations are prohibited because they obscure the owning
+route and duplicate delegation.
 
-## Scalar reference control flow
+## Hashing and codecs
 
-- `TCRef::While` is encoded as `/state/scalar/ref/while` with a three-element tuple
-  `[cond, closure, state]`, mirroring v1 semantics.
-- `TCRef::Cond` is the canonical conditional ref, encoded as `/state/scalar/ref/cond`
-  with `[cond, then, or_else]`, where `cond` is a scalar ref and each branch is
-  any scalar (including an `OpDef` scalar for lazy branch execution).
-- Conditional references have one representation: `/state/scalar/ref/cond`.
-- `TCRef::ForEach` is encoded as `/state/scalar/ref/for_each` with `[items, op, item_name]`,
-  where `items` is a scalar collection (tuple or map), `op` is an OpDef, and `item_name` is a
-  string Id used as the item parameter when invoking `op`. When `items` is a map, iteration
-  yields keys in deterministic `Id` order.
-- The loop condition and closure are OpDefs, executed with a loop-carried `state` input.
+The algebra implements `async_hash::Hash` directly. Maps use deterministic key
+order and sequences preserve their semantic order. These are structural hashes
+of decoded forms, not application digest policy. Hashing must not depend on JSON
+whitespace or transport encoding.
 
-## Error & backpressure expectations
+Every `FromStream` implementation accepts the form emitted by its `IntoStream`
+implementation. Encoding must not implement equality, hashing, cloning,
+validation, routing, or local delegation.
 
-- Handlers report standardized error categories (authorization, validation, transient, etc.) so callers can take consistent action.
-- Asynchronous/streaming handlers must signal when they need to yield or when backpressure should be applied, without leaking implementation-specific types.
+## Boundary rule
 
-## Validation guidance
+A one-entry application literal is decoded at the host or client boundary into
+an ordinary PUT whose key is its identity `Link` and whose value is its ordinary
+definition `State`. It is not an IR variant or envelope. Application roots,
+semantic versions, installation rules, digest composition, immutable-version
+policy, dependency enforcement, and graph scheduling are deliberately absent
+from `tc-ir`.
 
-`tc-ir` will eventually ship compliance tests to confirm that a binding:
+## Review checklist
 
-1. Declares which interaction patterns each handler uses.
-2. Produces deterministic results when invoked repeatedly with identical inputs.
-3. Enforces capability masks consistently across all patterns.
-4. Cooperates with the global scheduler for asynchronous and streaming workloads.
-
-## Authorization alignment
-
-- Authorization data will be the same used by the upstream control plane (e.g., the a16z server reference implementation). To stay in sync:
-  - Control-plane services issue short-lived tokens that embed principal ID, tenant ID, capability bits, and quota hints. Bindings consume these tokens via the implicit authorization context, not by parsing headers manually.
-  - Trait implementors must treat capability bits as the sole source of truth for what an operation may do; no handler should hard-code policy independent of the control plane.
-  - When the control plane updates capability definitions or tenant policies, bindings must be able to reload the new policy bundle without code changes.
-- The IR guidelines here define how handlers *consume* authorization; the actual issuance, validation, and rotation flows remain centralized in the control-plane/a16z server stack. Any divergence between the two must be treated as a compatibility bug.
+1. Is the change part of the reusable IR algebra or its native public contract?
+2. Is recursive behavior implemented beside its owning value?
+3. Is native execution independent of serialization and transport?
+4. Are codecs symmetric and hashes deterministic?
+5. Could this policy instead belong to a concrete runtime or adapter boundary?
+6. Does every emitted operation obey single assignment and lexical no-shadowing?

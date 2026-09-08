@@ -1,32 +1,30 @@
 # Contributing to `tc-ir`
 
-`tc-ir` defines the shared intermediate representation (IR) TinyChain adapters,
-hosts, and tooling consume. Keep it dependency-light and semantically stable so
-every part of the stack can agree on manifests, scalar ops, and graph topology
-without mirroring host internals.
+`tc-ir` defines the shared intermediate representation TinyChain adapters,
+hosts, and tooling consume. Keep it dependency-light and transport-neutral.
 
 ## How this crate fits into TinyChain
 
-- Acts as the canonical schema for `Scalar`, `TCRef`, manifests, and operation
-  graphs that adapters compile before handing work to `tc-server`.
-- Serves as the contract between higher-level runtimes (Python, WASM, future
-  bindings) and the kernel, so behavior changes here ripple across the fleet.
-- Documents IR expectations in `IR_INTERFACE_GUIDELINES.md`, keeping new fields
-  versioned and backward-compatible.
+- Owns the scalar/reference/operation algebra, intrinsic syntactic queries,
+  structural hashing, and shared native invocation/lifecycle contracts.
+- Defines contracts consumed by State and host runtimes without depending on
+  either runtime or on adapters.
+- Documents stable semantics in `IR_INTERFACE_GUIDELINES.md`; proposed shapes
+  belong in a roadmap until implemented.
 
 ## Contribution workflow
 
-1. Align proposed changes with `AGENTS.md` in this repository (graph-first
-   modeling, shared primitives, no bespoke transports).
+1. Read the workspace and crate `AGENTS.md` files.
 2. Keep formatting and linting clean: run `cargo fmt` and
    `cargo clippy --all-targets --all-features -D warnings` before sending
    patches.
-3. Add or update documentation in `IR_INTERFACE_GUIDELINES.md` whenever you
-   introduce, rename, or deprecate IR structures or macros.
-4. Run `cargo test -p tc-ir` to validate serialization/round-trip behavior, plus
-   any adapter tests that exercise the new surface area.
-5. Highlight downstream migration steps in your PR so adapters can adopt the
-   revised IR without guesswork.
+3. Update `IR_INTERFACE_GUIDELINES.md` when a stable public semantic contract
+   changes; do not duplicate private implementation details there.
+4. Run `cargo test --all-targets --all-features` and the affected adapter fixture
+   tests.
+5. Treat a canonical representation change as an explicit breaking change. Do
+   not hide it behind optional fields or a second decoder unless a separate
+   compatibility contract has been approved.
 
 ## Rights and licensing
 

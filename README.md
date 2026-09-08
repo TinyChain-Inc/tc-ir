@@ -1,56 +1,30 @@
 # tc-ir
 
-`tc-ir` defines the TinyChain intermediate representation—the transport-neutral
-graph that adapters, hosts, and libraries share. Every handler, route, and
-transaction compiles down to these primitives so behavior stays identical across
-HTTP, PyO3, WASM, or future transports.
+`tc-ir` owns TinyChain's transport-neutral scalar, reference, and operation
+algebra and the small native contracts shared by runtimes.
 
-## Key concepts
+## Owned contracts
 
-- **`TCRef` & `Scalar`.** The building blocks for graph nodes. `Scalar::Op`
-  wraps verbs (`Get`, `Put`, `Post`, `Delete`), while `Scalar::Ref` points to a
-  `TCRef` in the compiled graph.
-- **`Link` & `Claim`.** Lightweight descriptors for ledger references and access
-  control that downstream crates (`tc-chain`, `tc-server`) rely on without
-  needing host context.
-- **Libraries and routes.** `LibrarySchema`, `LibraryModule`, `Dir`, and the
-  `tc_library_routes!` macro make it easy to declare `/lib/...` manifests that
-  compile once but run across adapters.
-- **Library modules.** `LibrarySchema`, `LibraryModule`, and route helpers are
-  transport-neutral definitions; only a kernel-issued transaction context may
-  invoke their handlers.
+- `Scalar`, `TCRef`, `OpRef`, `OpDef`, `Map`, and `Id` describe values and
+  deferred computation.
+- `Transaction` and `Transact` describe protocol identity and resource
+  lifecycle.
+- `Method`, `Handler`, `Route`, and `Public` form the native verb and routing
+  boundary. A handler exposes only its supported verb closures.
+- `IntoView` acquires a transaction-consistent native view independently of
+  wire encoding.
 
-See `AGENTS.md` for design constraints (dependency hygiene, backward
-compatibility) and `IR_INTERFACE_GUIDELINES.md` for field-by-field documentation.
+The crate does not interpret `State`, classify applications, schedule graphs,
+resolve dependencies, define installation payloads, or own runtime and adapter
+policy. The normative boundary is defined by the
+[IR interface guidelines](IR_INTERFACE_GUIDELINES.md).
 
-## Building & testing
+## Development
 
 ```bash
-cargo build -p tc-ir
-cargo test  -p tc-ir
+cargo test --all-targets --all-features
 ```
 
-When you touch serialization logic, add round-trip tests to catch regressions
-early.
-
-## Extending the IR
-
-1. **Stay transport-neutral.** Avoid types that require host-specific context or
-   global state. If a new capability is needed, encode it in terms of existing
-   primitives (`Scalar`, `Link`, `Claim`) so every adapter can understand it.
-2. **Version consciously.** If a schema needs an additional field, add it in a
-   backward-compatible way (e.g., `Option`al fields) and document the change in
-   `IR_INTERFACE_GUIDELINES.md`.
-3. **Macros and helpers.** Prefer compile-time helpers like
-   `tc_library_routes!` for repetitive patterns. Keep them small and well-tested
-   so downstream crates can trust the generated structures.
-4. **Testing discipline.** Run `cargo test -p tc-ir` and update examples when a
-   change affects public APIs. The IR is a contract—the tests are the first line
-   of defense against breaking other crates.
-
-## Related references
-
-- Workspace `ARCHITECTURE.md` – IR and adapter sections.
-- `tc-server/src/library.rs` – shows how the host consumes `LibraryModule` and
-  route helpers.
-- `tc-wasm` – pairs this IR with WASM artifacts for distribution.
+Changes to an IR form require symmetric codec tests. Changes to hashing require
+deterministic golden tests. See the [crate notes](AGENTS.md) and workspace
+[architecture](../ARCHITECTURE.md).
