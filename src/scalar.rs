@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::{fmt, str::FromStr};
 
 use async_hash::{Digest, Hash, Output};
@@ -35,41 +36,7 @@ impl Scalar {
     /// This is a syntactic query. It neither resolves nor mutates a runtime
     /// namespace; the caller owns the request-local accumulator.
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
-        match self {
-            Self::Value(_) => {}
-            Self::Ref(reference) => reference.requires(required),
-            Self::Op(op) => op.requires(required),
-            Self::Map(map) => {
-                for scalar in map.values() {
-                    scalar.requires(required);
-                }
-            }
-            Self::Tuple(tuple) => {
-                for scalar in tuple {
-                    scalar.requires(required);
-                }
-            }
-        }
-    }
-
-    pub(crate) fn validate_scope(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
-        match self {
-            Self::Value(_) => Ok(()),
-            Self::Ref(reference) => reference.validate_scope(visible),
-            Self::Op(op) => op.validate_with_visible(visible),
-            Self::Map(map) => {
-                for scalar in map.values() {
-                    scalar.validate_scope(visible)?;
-                }
-                Ok(())
-            }
-            Self::Tuple(tuple) => {
-                for scalar in tuple {
-                    scalar.validate_scope(visible)?;
-                }
-                Ok(())
-            }
-        }
+        collect_requires(RequireNode::Scalar(self), required)
     }
 
     /// Visit each method invoked on a concrete link in this scalar.
@@ -94,6 +61,246 @@ impl Scalar {
                 for scalar in tuple {
                     scalar.visit_referenced_methods(visitor);
                 }
+            }
+        }
+    }
+}
+
+enum ValidateNode<'a> {
+    Scalar(&'a Scalar),
+    Ref(&'a crate::TCRef),
+    OpRef(&'a crate::OpRef),
+    OpDef(&'a crate::OpDef),
+}
+
+pub(crate) fn validate_op(op: &crate::OpDef, visible: &BTreeSet<Id>) -> TCResult<()> {
+    let mut pending = vec![(ValidateNode::OpDef(op), Arc::new(visible.clone()))];
+    while let Some((node, visible)) = pending.pop() {
+        match node {
+            ValidateNode::Scalar(Scalar::Value(_)) => {}
+            ValidateNode::Scalar(Scalar::Ref(reference)) => {
+                pending.push((ValidateNode::Ref(reference), visible));
+            }
+            ValidateNode::Scalar(Scalar::Op(op)) => {
+                pending.push((ValidateNode::OpDef(op), visible));
+            }
+            ValidateNode::Scalar(Scalar::Map(map)) => pending.extend(
+                map.values()
+                    .rev()
+                    .map(|scalar| (ValidateNode::Scalar(scalar), Arc::clone(&visible))),
+            ),
+            ValidateNode::Scalar(Scalar::Tuple(tuple)) => pending.extend(
+                tuple
+                    .iter()
+                    .rev()
+                    .map(|scalar| (ValidateNode::Scalar(scalar), Arc::clone(&visible))),
+            ),
+            ValidateNode::OpDef(op) => {
+                if op.form().is_empty() {
+                    return Err(TCError::bad_request(
+                        "an OpDef must define at least one provider",
+                    ));
+                }
+                let mut scope = (*visible).clone();
+                let mut local = BTreeSet::new();
+                match op {
+                    crate::OpDef::Get((key, _)) | crate::OpDef::Delete((key, _)) => {
+                        crate::op::bind(&mut scope, &mut local, key, "parameter")?;
+                    }
+                    crate::OpDef::Put((key, value, _)) => {
+                        crate::op::bind(&mut scope, &mut local, key, "parameter")?;
+                        crate::op::bind(&mut scope, &mut local, value, "parameter")?;
+                    }
+                    crate::OpDef::Post(_) => {}
+                }
+                for (id, _) in op.form() {
+                    crate::op::bind(&mut scope, &mut local, id, "provider")?;
+                }
+                let scope = Arc::new(scope);
+                pending.extend(
+                    op.form()
+                        .iter()
+                        .rev()
+                        .map(|(_, scalar)| (ValidateNode::Scalar(scalar), Arc::clone(&scope))),
+                );
+            }
+            ValidateNode::Ref(crate::TCRef::Id(_)) => {}
+            ValidateNode::Ref(crate::TCRef::Op(op)) => {
+                pending.push((ValidateNode::OpRef(op), visible));
+            }
+            ValidateNode::Ref(crate::TCRef::Cond(cond)) => {
+                pending.push((ValidateNode::Scalar(&cond.or_else), Arc::clone(&visible)));
+                pending.push((ValidateNode::Scalar(&cond.then), Arc::clone(&visible)));
+                pending.push((ValidateNode::Ref(&cond.cond), visible));
+            }
+            ValidateNode::Ref(crate::TCRef::After(after)) => {
+                pending.push((ValidateNode::Scalar(&after.then), Arc::clone(&visible)));
+                pending.push((ValidateNode::Scalar(&after.when), visible));
+            }
+            ValidateNode::Ref(crate::TCRef::While(while_ref)) => {
+                pending.push((ValidateNode::Scalar(&while_ref.state), Arc::clone(&visible)));
+                let mut callback = (*visible).clone();
+                crate::op::bind(
+                    &mut callback,
+                    &mut BTreeSet::new(),
+                    &"state".parse().expect("reserved callback Id"),
+                    "While callback parameter",
+                )?;
+                let callback = Arc::new(callback);
+                pending.push((
+                    ValidateNode::Scalar(&while_ref.closure),
+                    Arc::clone(&callback),
+                ));
+                pending.push((ValidateNode::Scalar(&while_ref.cond), callback));
+            }
+            ValidateNode::Ref(crate::TCRef::ForEach(for_each)) => {
+                pending.push((ValidateNode::Scalar(&for_each.items), Arc::clone(&visible)));
+                let mut body = (*visible).clone();
+                crate::op::bind(
+                    &mut body,
+                    &mut BTreeSet::new(),
+                    &for_each.item_name,
+                    "ForEach item",
+                )?;
+                pending.push((ValidateNode::Scalar(&for_each.op), Arc::new(body)));
+            }
+            ValidateNode::OpRef(op) => {
+                let scalars: Vec<&Scalar> = match op {
+                    crate::OpRef::Get((_, key)) | crate::OpRef::Delete((_, key)) => vec![key],
+                    crate::OpRef::Put((_, key, value)) => vec![key, value],
+                    crate::OpRef::Post((_, params)) => params.values().collect(),
+                };
+                pending.extend(
+                    scalars
+                        .into_iter()
+                        .rev()
+                        .map(|scalar| (ValidateNode::Scalar(scalar), Arc::clone(&visible))),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+enum RequireNode<'a> {
+    Scalar(&'a Scalar),
+    Ref(&'a crate::TCRef),
+    OpRef(&'a crate::OpRef),
+    OpDef(&'a crate::OpDef),
+}
+
+pub(crate) fn collect_op_requires(op: &crate::OpDef, required: &mut BTreeSet<Id>) {
+    collect_requires(RequireNode::OpDef(op), required)
+}
+
+pub(crate) fn collect_op_ref_requires(op: &crate::OpRef, required: &mut BTreeSet<Id>) {
+    collect_requires(RequireNode::OpRef(op), required)
+}
+
+pub(crate) fn collect_ref_requires(reference: &crate::TCRef, required: &mut BTreeSet<Id>) {
+    collect_requires(RequireNode::Ref(reference), required)
+}
+
+fn collect_requires(initial: RequireNode<'_>, required: &mut BTreeSet<Id>) {
+    let mut pending = vec![(initial, Arc::new(BTreeSet::new()))];
+    while let Some((node, bound)) = pending.pop() {
+        match node {
+            RequireNode::Scalar(Scalar::Value(_)) => {}
+            RequireNode::Scalar(Scalar::Ref(reference)) => {
+                pending.push((RequireNode::Ref(reference), bound));
+            }
+            RequireNode::Scalar(Scalar::Op(op)) => {
+                pending.push((RequireNode::OpDef(op), bound));
+            }
+            RequireNode::Scalar(Scalar::Map(map)) => {
+                pending.extend(
+                    map.values()
+                        .rev()
+                        .map(|scalar| (RequireNode::Scalar(scalar), Arc::clone(&bound))),
+                );
+            }
+            RequireNode::Scalar(Scalar::Tuple(tuple)) => {
+                pending.extend(
+                    tuple
+                        .iter()
+                        .rev()
+                        .map(|scalar| (RequireNode::Scalar(scalar), Arc::clone(&bound))),
+                );
+            }
+            RequireNode::OpDef(op) => {
+                let mut local = (*bound).clone();
+                match op {
+                    crate::OpDef::Get((key, _)) | crate::OpDef::Delete((key, _)) => {
+                        local.insert(key.clone());
+                    }
+                    crate::OpDef::Put((key, value, _)) => {
+                        local.insert(key.clone());
+                        local.insert(value.clone());
+                    }
+                    crate::OpDef::Post(_) => {}
+                }
+                local.extend(op.form().iter().map(|(id, _)| id.clone()));
+                let local = Arc::new(local);
+                pending.extend(
+                    op.form()
+                        .iter()
+                        .rev()
+                        .map(|(_, scalar)| (RequireNode::Scalar(scalar), Arc::clone(&local))),
+                );
+            }
+            RequireNode::Ref(crate::TCRef::Id(id)) => {
+                if id.as_str() != "self" && !bound.contains(id.id()) {
+                    required.insert(id.id().clone());
+                }
+            }
+            RequireNode::Ref(crate::TCRef::Op(op)) => {
+                pending.push((RequireNode::OpRef(op), bound));
+            }
+            RequireNode::Ref(crate::TCRef::Cond(cond)) => {
+                pending.push((RequireNode::Scalar(&cond.or_else), Arc::clone(&bound)));
+                pending.push((RequireNode::Scalar(&cond.then), Arc::clone(&bound)));
+                pending.push((RequireNode::Ref(&cond.cond), bound));
+            }
+            RequireNode::Ref(crate::TCRef::After(after)) => {
+                pending.push((RequireNode::Scalar(&after.then), Arc::clone(&bound)));
+                pending.push((RequireNode::Scalar(&after.when), bound));
+            }
+            RequireNode::Ref(crate::TCRef::While(while_ref)) => {
+                pending.push((RequireNode::Scalar(&while_ref.state), Arc::clone(&bound)));
+                let mut callback = (*bound).clone();
+                callback.insert("state".parse().expect("reserved callback Id"));
+                let callback = Arc::new(callback);
+                pending.push((
+                    RequireNode::Scalar(&while_ref.closure),
+                    Arc::clone(&callback),
+                ));
+                pending.push((RequireNode::Scalar(&while_ref.cond), callback));
+            }
+            RequireNode::Ref(crate::TCRef::ForEach(for_each)) => {
+                pending.push((RequireNode::Scalar(&for_each.items), Arc::clone(&bound)));
+                let mut body = (*bound).clone();
+                body.insert(for_each.item_name.clone());
+                pending.push((RequireNode::Scalar(&for_each.op), Arc::new(body)));
+            }
+            RequireNode::OpRef(op) => {
+                let (subject, scalars): (&crate::Subject, Vec<&Scalar>) = match op {
+                    crate::OpRef::Get((subject, key)) | crate::OpRef::Delete((subject, key)) => {
+                        (subject, vec![key])
+                    }
+                    crate::OpRef::Put((subject, key, value)) => (subject, vec![key, value]),
+                    crate::OpRef::Post((subject, params)) => (subject, params.values().collect()),
+                };
+                if let crate::Subject::Ref(id, _) = subject {
+                    if id.as_str() != "self" && !bound.contains(id.id()) {
+                        required.insert(id.id().clone());
+                    }
+                }
+                pending.extend(
+                    scalars
+                        .into_iter()
+                        .rev()
+                        .map(|scalar| (RequireNode::Scalar(scalar), Arc::clone(&bound))),
+                );
             }
         }
     }

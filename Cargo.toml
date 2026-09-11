@@ -8,9 +8,8 @@ async-hash = { path = "../deps/async-hash", version = "0.6" }
 destream = { path = "../deps/destream", version = "0.10" }
 hr-id = { path = "../deps/hr-id", version = "0.7", features = ["hash", "stream"] }
 safecast = "0.2"
-umask = "2.1"
 pathlink = { path = "../deps/pathlink", features = ["hash", "stream"] }
-tc-error = { path = "../tc-error" }
+tc-error = { path = "../tc-error", features = ["pathlink"] }
 tc-value = { path = "../tc-value" }
 number-general = { path = "../deps/number-general", version = "0.14", default-features = false, features = ["hash", "stream"] }
 

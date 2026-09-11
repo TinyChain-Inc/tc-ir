@@ -1,6 +1,5 @@
 use std::{fmt, str::FromStr};
 
-use pathlink::Link;
 /// Network time as nanoseconds since Unix epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NetworkTime(u64);
@@ -122,12 +121,6 @@ impl FromStr for TxnId {
 pub trait Transaction: Send + Sync {
     /// Unique identifier chosen by the control plane.
     fn id(&self) -> TxnId;
-
-    /// Consensus timestamp (deterministic per transaction).
-    fn timestamp(&self) -> NetworkTime;
-
-    /// Authorization claim scoped to this transaction.
-    fn claim(&self) -> &Claim;
 }
 
 /// Transaction lifecycle callbacks.
@@ -149,28 +142,4 @@ pub trait Transact: Send + Sync {
         &self,
         txn_id: &TxnId,
     ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send;
-}
-
-/// Authorization data issued by the control-plane / IAM stack.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Claim {
-    pub link: Link,
-    pub mask: umask::Mode,
-}
-
-impl Claim {
-    pub fn new(link: Link, mask: umask::Mode) -> Self {
-        Self { link, mask }
-    }
-
-    /// Return true if this claim grants the required mask.
-    pub fn allows(&self, link: &Link, required: umask::Mode) -> bool {
-        if self.link != *link {
-            return false;
-        }
-
-        let have: u32 = self.mask.into();
-        let need: u32 = required.into();
-        have & need == need
-    }
 }

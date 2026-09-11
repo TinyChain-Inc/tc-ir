@@ -114,67 +114,13 @@ impl OpDef {
         }
     }
 
-    pub const fn method(&self) -> Method {
-        match self {
-            Self::Get(_) => Method::Get,
-            Self::Put(_) => Method::Put,
-            Self::Post(_) => Method::Post,
-            Self::Delete(_) => Method::Delete,
-        }
-    }
-
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
-        // An OpDef is a lexical scope. Use a local accumulator so removing
-        // its bound names cannot erase requirements contributed by siblings.
-        let mut local = BTreeSet::new();
-        for (_, scalar) in self.form() {
-            scalar.requires(&mut local);
-        }
-        for (defined, _) in self.form() {
-            local.remove(defined);
-        }
-        match self {
-            Self::Get((key, _)) | Self::Delete((key, _)) => {
-                local.remove(key);
-            }
-            Self::Put((key, value, _)) => {
-                local.remove(key);
-                local.remove(value);
-            }
-            Self::Post(_) => {}
-        }
-        required.extend(local);
+        crate::scalar::collect_op_requires(self, required)
     }
 
     /// Validate that this operation is a single-assignment lexical scope.
     pub fn validate(&self) -> TCResult<()> {
-        self.validate_with_visible(&BTreeSet::new())
-    }
-
-    pub(crate) fn validate_with_visible(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
-        let mut scope = visible.clone();
-        let mut local = BTreeSet::new();
-
-        match self {
-            Self::Get((key, _)) | Self::Delete((key, _)) => {
-                bind(&mut scope, &mut local, key, "parameter")?
-            }
-            Self::Put((key, value, _)) => {
-                bind(&mut scope, &mut local, key, "parameter")?;
-                bind(&mut scope, &mut local, value, "parameter")?;
-            }
-            Self::Post(_) => {}
-        }
-
-        for (id, _) in self.form() {
-            bind(&mut scope, &mut local, id, "provider")?;
-        }
-
-        for (_, scalar) in self.form() {
-            scalar.validate_scope(&scope)?;
-        }
-
-        Ok(())
+        crate::scalar::validate_op(self, &BTreeSet::new())
     }
 }
 
@@ -208,44 +154,7 @@ pub(crate) fn bind(
 
 impl OpRef {
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
-        let subject = match self {
-            Self::Get((subject, key)) | Self::Delete((subject, key)) => {
-                key.requires(required);
-                subject
-            }
-            Self::Put((subject, key, value)) => {
-                key.requires(required);
-                value.requires(required);
-                subject
-            }
-            Self::Post((subject, params)) => {
-                for scalar in params.values() {
-                    scalar.requires(required);
-                }
-                subject
-            }
-        };
-        if let Subject::Ref(id, _) = subject {
-            if id.as_str() != "self" {
-                required.insert(id.id().clone());
-            }
-        }
-    }
-
-    pub(crate) fn validate_scope(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
-        match self {
-            Self::Get((_, key)) | Self::Delete((_, key)) => key.validate_scope(visible),
-            Self::Put((_, key, value)) => {
-                key.validate_scope(visible)?;
-                value.validate_scope(visible)
-            }
-            Self::Post((_, params)) => {
-                for scalar in params.values() {
-                    scalar.validate_scope(visible)?;
-                }
-                Ok(())
-            }
-        }
+        crate::scalar::collect_op_ref_requires(self, required)
     }
 
     pub(crate) fn visit_referenced_methods(
@@ -661,6 +570,8 @@ mod tests {
 
     #[test]
     fn validation_enforces_single_assignment() {
+        assert!(OpDef::Post(Vec::new()).validate().is_err());
+
         let duplicate = OpDef::Post(vec![
             (id("result"), Scalar::from(1_u64)),
             (id("result"), Scalar::from(2_u64)),
@@ -670,7 +581,11 @@ mod tests {
         let shadows_parameter = OpDef::Get((id("key"), vec![(id("key"), Scalar::from(1_u64))]));
         assert!(shadows_parameter.validate().is_err());
 
-        let duplicate_parameters = OpDef::Put((id("value"), id("value"), Vec::new()));
+        let duplicate_parameters = OpDef::Put((
+            id("value"),
+            id("value"),
+            vec![(id("result"), Scalar::default())],
+        ));
         assert!(duplicate_parameters.validate().is_err());
 
         let reserved = OpDef::Post(vec![(id("self"), Scalar::from(1_u64))]);
@@ -706,8 +621,8 @@ mod tests {
             (
                 id("result"),
                 Scalar::from(TCRef::While(Box::new(crate::While::new(
-                    Scalar::Op(OpDef::Post(Vec::new())),
-                    Scalar::Op(OpDef::Post(Vec::new())),
+                    Scalar::Op(OpDef::Post(vec![(id("condition"), Scalar::from(1_u64))])),
+                    Scalar::Op(OpDef::Post(vec![(id("next"), Scalar::from(0_u64))])),
                     Scalar::from(0_u64),
                 )))),
             ),
@@ -737,6 +652,15 @@ mod tests {
         let error = decoded.expect_err("reject duplicate binding");
 
         assert!(error.to_string().contains("duplicate OpDef binding"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn decoding_rejects_an_empty_operation() {
+        let encoded = destream_json::encode(OpDef::Post(Vec::new())).expect("encode empty OpDef");
+        let decoded: Result<OpDef, _> = destream_json::try_decode((), encoded).await;
+        let error = decoded.expect_err("reject empty operation");
+
+        assert!(error.to_string().contains("at least one provider"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

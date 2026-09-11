@@ -39,6 +39,12 @@ providers. Every provider is visible throughout its form, so forward references
 are valid. Resolution never escapes this frame into an application, filesystem,
 process-global, or mutable namespace.
 
+Every `OpDef` must contain at least one provider; the last provider is its
+capture. Empty read and write operations are rejected uniformly rather than
+having verb-dependent defaults. Independent ready providers may execute
+concurrently. Any required ordering, including ordering between effects, must be
+represented by a lexical dependency or `After`.
+
 | Form | Bindings introduced |
 | --- | --- |
 | GET | key parameter |
@@ -63,7 +69,8 @@ BTreeSet<Id>)` adds only syntactically referenced names not bound by the inspect
 form. Mutating this caller-owned accumulator is dependency collection, not
 namespace mutation. `ForEach` subtracts its item binding from body requirements;
 `While` subtracts `$state` from its callbacks while retaining requirements of
-its initial-state expression.
+its initial-state expression. Implementations must traverse untrusted recursive
+syntax with an explicit work stack rather than relying on the native call stack.
 
 At POST invocation, every required input must be present. Generic IR permits
 additional request-map entries because a concrete handler may intentionally
@@ -89,9 +96,17 @@ namespace traversal belongs in `Route`. A genuinely new nested invocation uses
 the runtime executor so its target, transaction scope, and authorization are
 preserved.
 
+Represent each selected operation with its concrete terminal handler. Such a
+handler may borrow the common route owner; it does not need to clone or wrap an
+owned copy of that resource. Do not replace these terminal types with an
+operation tag or aggregate handler, because selecting that tag inside a verb
+method creates a second dispatcher after `Route`.
+
 `Transaction` is a native capability, not a serializable header. Real wire
 boundaries carry the canonical `TxnId` through their protocol-defined channel;
-authorization stays in that boundary's authenticated claim mechanism. Do not
+authorization claims are server-owned policy and stay in that boundary's
+authenticated mechanism. The shared transaction capability exposes only its
+`TxnId`; it does not expose authorization, wall-clock time, or protocol state. Do not
 mirror transaction identity, time, or claims in an IR envelope.
 
 Handlers never receive codecs, HTTP bodies, Python objects, WASM memory, or host

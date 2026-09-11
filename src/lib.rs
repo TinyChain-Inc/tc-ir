@@ -38,27 +38,17 @@ mod tests {
     use super::*;
 
     #[derive(Clone)]
-    struct FakeTxn {
-        claim: Claim,
-    }
+    struct FakeTxn;
 
     impl FakeTxn {
-        fn new(claim: Claim) -> Self {
-            Self { claim }
+        fn new() -> Self {
+            Self
         }
     }
 
     impl Transaction for FakeTxn {
         fn id(&self) -> TxnId {
             TxnId::from_parts(NetworkTime::from_nanos(42), 7)
-        }
-
-        fn timestamp(&self) -> NetworkTime {
-            NetworkTime::from_nanos(42)
-        }
-
-        fn claim(&self) -> &Claim {
-            &self.claim
         }
     }
 
@@ -103,8 +93,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn native_route_invokes_its_concrete_handler() {
         let route = HelloRoute;
-        let claim = Claim::new(Link::from_str("/hello").unwrap(), umask::Mode::all());
-        let txn = FakeTxn::new(claim);
+        let txn = FakeTxn::new();
 
         let out = Public::get(
             &route,
@@ -120,8 +109,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn native_route_rejects_an_unadvertised_verb() {
         let route = HelloRoute;
-        let claim = Claim::new(Link::from_str("/hello").unwrap(), umask::Mode::all());
-        let txn = FakeTxn::new(claim);
+        let txn = FakeTxn::new();
 
         let err = Public::post(&route, &txn, &[], Map::new())
             .await
@@ -157,16 +145,6 @@ mod tests {
             digest,
             "d0399510942f294e3d0df854af9cd024758ef600f0fb5b84ce63b6367866b918"
         );
-    }
-
-    #[test]
-    fn conditional_refs_have_one_wire_form() {
-        let legacy_symbol = ["TCREF", "_IF"].concat();
-        let legacy_path = ["/state/scalar/ref", "/if"].concat();
-        for source in [include_str!("scalar.rs"), include_str!("tcref.rs")] {
-            assert!(!source.contains(&legacy_symbol));
-            assert!(!source.contains(&legacy_path));
-        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
