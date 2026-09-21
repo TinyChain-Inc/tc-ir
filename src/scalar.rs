@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::{fmt, str::FromStr};
 
 use async_hash::{Digest, Hash, Output};
-use destream::{de, en, IntoStream};
+use destream::{de, en};
 use number_general::Number;
 use pathlink::{path_label, Link, PathBuf, PathLabel};
 use tc_error::{TCError, TCResult};
@@ -632,7 +632,13 @@ impl<'en> en::IntoStream<'en> for Scalar {
 
 impl<'en> en::ToStream<'en> for Scalar {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
+        match self {
+            Self::Value(value) => value.to_stream(encoder),
+            Self::Ref(reference) => reference.to_stream(encoder),
+            Self::Op(op) => op.to_stream(encoder),
+            Self::Map(map) => map.to_stream(encoder),
+            Self::Tuple(tuple) => tuple.to_stream(encoder),
+        }
     }
 }
 

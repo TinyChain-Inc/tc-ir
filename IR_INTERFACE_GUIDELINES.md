@@ -81,6 +81,13 @@ ready set observes an immutable snapshot of prior results.
 
 ## Native routing
 
+GET is read-only. POST may compose effects, but every write must be an ordinary
+PUT or DELETE invocation through the owning resource. Native POST implementations
+must not mutate collection storage directly or bypass the owning Chain's write
+boundary. A future MetricsChain policy may define recorded metrics effects for
+GET; that exception is not implemented. A GET returning a native collection view
+does not itself mutate the collection or introduce an ownership wrapper.
+
 `Route<State>` resolves a suffix to one `Handler<State>`. A handler
 synchronously selects an optional GET, PUT, POST, or DELETE closure; only that
 selected closure erases its asynchronous future. An absent closure is the
@@ -109,6 +116,10 @@ authenticated mechanism. The shared transaction capability exposes only its
 `TxnId`; it does not expose authorization, wall-clock time, or protocol state. Do not
 mirror transaction identity, time, or claims in an IR envelope.
 
+`TxnId` owns its format-neutral `destream` codecs. They encode its existing
+string representation and delegate decoding to `FromStr`; composite codecs
+use `TxnId` directly instead of repeating string conversion and parsing.
+
 Handlers never receive codecs, HTTP bodies, Python objects, WASM memory, or host
 storage. Native composition passes `State` directly. Serialization occurs only
 at a transport, persistence, sandbox, or foreign-runtime boundary. The concrete
@@ -117,6 +128,10 @@ or reference implementations are prohibited because they obscure the owning
 route and duplicate delegation.
 
 ## Hashing and codecs
+
+Owned and borrowed streaming codecs use the same representation. Borrowed codecs
+delegate recursively to their semantic children without cloning the expression
+tree; fixed argument sequences use native tuples.
 
 The algebra implements `async_hash::Hash` directly. Maps use deterministic key
 order and sequences preserve their semantic order. These are structural hashes

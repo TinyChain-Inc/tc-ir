@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use crate::{Id, Map, Method, Scalar, Subject};
 use async_hash::{Digest, Hash, Output};
-use destream::{de, en, EncodeMap, IntoStream};
+use destream::{de, en, EncodeMap};
 use pathlink::PathBuf;
 use tc_error::{TCError, TCResult};
 
@@ -266,7 +266,17 @@ impl<'en> en::IntoStream<'en> for OpDef {
 
 impl<'en> en::ToStream<'en> for OpDef {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
+        use destream::en::EncodeMap;
+
+        let mut map = encoder.encode_map(Some(1))?;
+        let class = self.class().path().to_string();
+        match self {
+            Self::Get(def) => map.encode_entry(class, def)?,
+            Self::Put(def) => map.encode_entry(class, def)?,
+            Self::Post(def) => map.encode_entry(class, def)?,
+            Self::Delete(def) => map.encode_entry(class, def)?,
+        }
+        map.end()
     }
 }
 
@@ -305,79 +315,37 @@ impl de::FromStream for OpRef {
 
 impl<'en> en::IntoStream<'en> for OpRef {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        let mut map = encoder.encode_map(Some(1))?;
         match self {
-            OpRef::Get((subject, key)) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_key(subject.to_string())?;
-                map.encode_value(ScalarSeq::new(vec![key]))?;
-                map.end()
+            Self::Get((subject, key)) => map.encode_entry(subject.to_string(), (key,))?,
+            Self::Put((subject, key, value)) => {
+                map.encode_entry(subject.to_string(), (key, value))?
             }
-            OpRef::Put((subject, key, value)) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_key(subject.to_string())?;
-                map.encode_value(ScalarSeq::new(vec![key, value]))?;
-                map.end()
-            }
-            OpRef::Post((subject, params)) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(subject.to_string(), params)?;
-                map.end()
-            }
-            OpRef::Delete((subject, key)) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_key(PathBuf::from(crate::OPREF_DELETE).to_string())?;
-                map.encode_value(SubjectScalarSeq::new(subject, key))?;
-                map.end()
-            }
+            Self::Post((subject, params)) => map.encode_entry(subject.to_string(), params)?,
+            Self::Delete((subject, key)) => map.encode_entry(
+                PathBuf::from(crate::OPREF_DELETE).to_string(),
+                (subject, key),
+            )?,
         }
+        map.end()
     }
 }
 
 impl<'en> en::ToStream<'en> for OpRef {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
-    }
-}
-
-struct ScalarSeq(Vec<Scalar>);
-
-impl ScalarSeq {
-    fn new(items: Vec<Scalar>) -> Self {
-        Self(items)
-    }
-}
-
-impl<'en> en::IntoStream<'en> for ScalarSeq {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeSeq;
-
-        let mut seq = encoder.encode_seq(Some(self.0.len()))?;
-        for item in self.0 {
-            seq.encode_element(item)?;
+        let mut map = encoder.encode_map(Some(1))?;
+        match self {
+            Self::Get((subject, key)) => map.encode_entry(subject.to_string(), (key,))?,
+            Self::Put((subject, key, value)) => {
+                map.encode_entry(subject.to_string(), (key, value))?
+            }
+            Self::Post((subject, params)) => map.encode_entry(subject.to_string(), params)?,
+            Self::Delete((subject, key)) => map.encode_entry(
+                PathBuf::from(crate::OPREF_DELETE).to_string(),
+                (subject, key),
+            )?,
         }
-        seq.end()
-    }
-}
-
-struct SubjectScalarSeq {
-    subject: Subject,
-    key: Scalar,
-}
-
-impl SubjectScalarSeq {
-    fn new(subject: Subject, key: Scalar) -> Self {
-        Self { subject, key }
-    }
-}
-
-impl<'en> en::IntoStream<'en> for SubjectScalarSeq {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeSeq;
-
-        let mut seq = encoder.encode_seq(Some(2))?;
-        seq.encode_element(self.subject)?;
-        seq.encode_element(self.key)?;
-        seq.end()
+        map.end()
     }
 }
 

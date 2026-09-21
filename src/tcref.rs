@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use async_hash::{Digest, Hash, Output};
-use destream::{de, en, IntoStream};
+use destream::{de, en};
 use pathlink::PathBuf;
 
 use crate::{Id, IdRef, Scalar};
@@ -179,20 +179,69 @@ impl de::FromStream for TCRef {
 
 impl<'en> en::IntoStream<'en> for TCRef {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            TCRef::Op(op) => op.into_stream(encoder),
-            TCRef::Id(id_ref) => encode_id_ref(id_ref, encoder),
-            TCRef::Cond(cond) => encode_cond(*cond, encoder),
-            TCRef::After(after) => encode_after(*after, encoder),
-            TCRef::While(while_ref) => encode_while_ref(*while_ref, encoder),
-            TCRef::ForEach(for_each) => encode_for_each_ref(*for_each, encoder),
+        use destream::en::EncodeMap;
+
+        if let Self::Op(op) = self {
+            return op.into_stream(encoder);
         }
+        let mut map = encoder.encode_map(Some(1))?;
+        match self {
+            Self::Op(_) => unreachable!(),
+            Self::Id(id) => map.encode_entry(id.to_string(), Vec::<()>::new())?,
+            Self::Cond(cond) => map.encode_entry(
+                PathBuf::from(crate::TCREF_COND).to_string(),
+                (cond.cond, cond.then, cond.or_else),
+            )?,
+            Self::After(after) => map.encode_entry(
+                PathBuf::from(crate::TCREF_AFTER).to_string(),
+                (after.when, after.then),
+            )?,
+            Self::While(while_ref) => map.encode_entry(
+                PathBuf::from(crate::TCREF_WHILE).to_string(),
+                (while_ref.cond, while_ref.closure, while_ref.state),
+            )?,
+            Self::ForEach(for_each) => map.encode_entry(
+                PathBuf::from(crate::TCREF_FOR_EACH).to_string(),
+                (for_each.items, for_each.op, for_each.item_name.to_string()),
+            )?,
+        }
+        map.end()
     }
 }
 
 impl<'en> en::ToStream<'en> for TCRef {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
+        use destream::en::EncodeMap;
+
+        if let Self::Op(op) = self {
+            return op.to_stream(encoder);
+        }
+        let mut map = encoder.encode_map(Some(1))?;
+        match self {
+            Self::Op(_) => unreachable!(),
+            Self::Id(id) => map.encode_entry(id.to_string(), Vec::<()>::new())?,
+            Self::Cond(cond) => map.encode_entry(
+                PathBuf::from(crate::TCREF_COND).to_string(),
+                (&cond.cond, &cond.then, &cond.or_else),
+            )?,
+            Self::After(after) => map.encode_entry(
+                PathBuf::from(crate::TCREF_AFTER).to_string(),
+                (&after.when, &after.then),
+            )?,
+            Self::While(while_ref) => map.encode_entry(
+                PathBuf::from(crate::TCREF_WHILE).to_string(),
+                (&while_ref.cond, &while_ref.closure, &while_ref.state),
+            )?,
+            Self::ForEach(for_each) => map.encode_entry(
+                PathBuf::from(crate::TCREF_FOR_EACH).to_string(),
+                (
+                    &for_each.items,
+                    &for_each.op,
+                    for_each.item_name.to_string(),
+                ),
+            )?,
+        }
+        map.end()
     }
 }
 
@@ -319,87 +368,4 @@ pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
 
     let op = crate::op::decode_opref_map_entry(key, map).await?;
     Ok(TCRef::Op(op))
-}
-
-struct ScalarSeq(Vec<Scalar>);
-
-impl ScalarSeq {
-    fn new(items: Vec<Scalar>) -> Self {
-        Self(items)
-    }
-}
-
-impl<'en> en::IntoStream<'en> for ScalarSeq {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeSeq;
-
-        let mut seq = encoder.encode_seq(Some(self.0.len()))?;
-        for item in self.0 {
-            seq.encode_element(item)?;
-        }
-        seq.end()
-    }
-}
-
-fn encode_id_ref<'en, E: en::Encoder<'en>>(id_ref: IdRef, encoder: E) -> Result<E::Ok, E::Error> {
-    use destream::en::EncodeMap;
-
-    let mut map = encoder.encode_map(Some(1))?;
-    map.encode_key(id_ref.to_string())?;
-    map.encode_value(ScalarSeq::new(Vec::new()))?;
-    map.end()
-}
-
-fn encode_cond<'en, E: en::Encoder<'en>>(cond: Cond, encoder: E) -> Result<E::Ok, E::Error> {
-    use destream::en::EncodeMap;
-
-    let mut map = encoder.encode_map(Some(1))?;
-    map.encode_key(PathBuf::from(crate::TCREF_COND).to_string())?;
-    map.encode_value(ScalarSeq::new(vec![
-        Scalar::from(cond.cond),
-        cond.then,
-        cond.or_else,
-    ]))?;
-    map.end()
-}
-
-fn encode_after<'en, E: en::Encoder<'en>>(after: After, encoder: E) -> Result<E::Ok, E::Error> {
-    use destream::en::EncodeMap;
-
-    let mut map = encoder.encode_map(Some(1))?;
-    map.encode_key(PathBuf::from(crate::TCREF_AFTER).to_string())?;
-    map.encode_value(ScalarSeq::new(vec![after.when, after.then]))?;
-    map.end()
-}
-
-fn encode_while_ref<'en, E: en::Encoder<'en>>(
-    while_ref: While,
-    encoder: E,
-) -> Result<E::Ok, E::Error> {
-    use destream::en::EncodeMap;
-
-    let mut map = encoder.encode_map(Some(1))?;
-    map.encode_key(PathBuf::from(crate::TCREF_WHILE).to_string())?;
-    map.encode_value(ScalarSeq::new(vec![
-        while_ref.cond,
-        while_ref.closure,
-        while_ref.state,
-    ]))?;
-    map.end()
-}
-
-fn encode_for_each_ref<'en, E: en::Encoder<'en>>(
-    for_each: ForEach,
-    encoder: E,
-) -> Result<E::Ok, E::Error> {
-    use destream::en::EncodeMap;
-
-    let mut map = encoder.encode_map(Some(1))?;
-    map.encode_key(PathBuf::from(crate::TCREF_FOR_EACH).to_string())?;
-    map.encode_value(ScalarSeq::new(vec![
-        for_each.items,
-        for_each.op,
-        Scalar::Value(Value::String(for_each.item_name.to_string())),
-    ]))?;
-    map.end()
 }

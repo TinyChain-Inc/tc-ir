@@ -5,6 +5,9 @@
 
 pub use hr_id::Id;
 
+/// A fixed-size SHA-256 digest, shared by semantic hash producers and consumers.
+pub type Sha256Hash = async_hash::Output<async_hash::Sha256>;
+
 mod txn;
 pub use txn::*;
 
@@ -147,6 +150,48 @@ mod tests {
         );
     }
 
+    async fn assert_borrowed<T>(value: &T)
+    where
+        T: Clone + for<'en> destream::en::IntoStream<'en> + for<'en> destream::en::ToStream<'en>,
+    {
+        use futures::TryStreamExt;
+        async fn bytes<'en>(value: impl destream::en::IntoStream<'en> + 'en) -> Vec<u8> {
+            destream_json::encode(value)
+                .unwrap()
+                .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                    bytes.extend_from_slice(&chunk);
+                    Ok(bytes)
+                })
+                .await
+                .unwrap()
+        }
+        assert_eq!(bytes(value).await, bytes(value.clone()).await);
+    }
+
+    #[tokio::test]
+    async fn borrowed_operation_variants_match_owned_encoding() {
+        let subject = Subject::Link("/example".parse().unwrap());
+        for op in [
+            OpRef::Get((subject.clone(), Scalar::default())),
+            OpRef::Put((subject.clone(), Scalar::default(), Scalar::Tuple(vec![]))),
+            OpRef::Post((subject.clone(), Map::new())),
+            OpRef::Delete((subject, Scalar::default())),
+        ] {
+            assert_borrowed(&op).await;
+            assert_borrowed(&TCRef::Op(op.clone())).await;
+            assert_borrowed(&Scalar::from(TCRef::Op(op))).await;
+        }
+        for op in [
+            OpDef::Get(("key".parse().unwrap(), vec![])),
+            OpDef::Put(("key".parse().unwrap(), "value".parse().unwrap(), vec![])),
+            OpDef::Post(vec![]),
+            OpDef::Delete(("key".parse().unwrap(), vec![])),
+        ] {
+            assert_borrowed(&op).await;
+            assert_borrowed(&Scalar::Op(op)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn scalar_map_roundtrip() {
         let mut inner = Map::new();
@@ -165,6 +210,7 @@ mod tests {
 
         let scalar = Scalar::Map(outer);
 
+        assert_borrowed(&scalar).await;
         let encoded = destream_json::encode(scalar.clone()).expect("encode scalar map");
         let decoded: Scalar = destream_json::try_decode((), encoded)
             .await
@@ -190,6 +236,7 @@ mod tests {
     async fn scalar_tuple_roundtrip() {
         let scalar = Scalar::Tuple(vec![Scalar::from(7_u64), Scalar::from(Value::from("x"))]);
 
+        assert_borrowed(&scalar).await;
         let encoded = destream_json::encode(scalar.clone()).expect("encode scalar tuple");
         let decoded: Scalar = destream_json::try_decode((), encoded)
             .await
@@ -204,6 +251,7 @@ mod tests {
         let op = OpRef::Get((Subject::Link(link), Scalar::default()));
         let scalar = Scalar::from(TCRef::Op(op));
 
+        assert_borrowed(&scalar).await;
         let encoded = destream_json::encode(scalar.clone()).expect("encode scalar ref");
         let decoded: Scalar = destream_json::try_decode((), encoded)
             .await
@@ -238,6 +286,7 @@ mod tests {
         ];
         let op = OpDef::Post(form);
 
+        assert_borrowed(&op).await;
         let encoded = destream_json::encode(op.clone()).expect("encode opdef");
         let decoded: OpDef = destream_json::try_decode((), encoded)
             .await
@@ -249,6 +298,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn tcref_id_roundtrip() {
         let tcref = TCRef::Id("$foo".parse().expect("IdRef"));
+        assert_borrowed(&tcref).await;
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref id");
         let decoded: TCRef = destream_json::try_decode((), encoded)
             .await
@@ -262,6 +312,7 @@ mod tests {
         let closure = Scalar::from(Value::from("step"));
         let state = Scalar::from(7_u64);
         let tcref = TCRef::While(Box::new(While::new(cond, closure, state)));
+        assert_borrowed(&tcref).await;
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref while");
         let decoded: TCRef = destream_json::try_decode((), encoded)
             .await
@@ -282,6 +333,7 @@ mod tests {
         )]));
         let tcref = TCRef::Cond(Box::new(Cond::new(cond, then, or_else)));
 
+        assert_borrowed(&tcref).await;
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref cond");
         let decoded: TCRef = destream_json::try_decode((), encoded)
             .await
@@ -296,6 +348,7 @@ mod tests {
         let then = Scalar::from(TCRef::Id("$read".parse().expect("IdRef")));
         let tcref = TCRef::After(Box::new(After::new(when, then)));
 
+        assert_borrowed(&tcref).await;
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref after");
         let decoded: TCRef = destream_json::try_decode((), encoded)
             .await
@@ -314,6 +367,7 @@ mod tests {
         let item_name = "item".parse().expect("Id");
         let tcref = TCRef::ForEach(Box::new(ForEach::new(items, op, item_name)));
 
+        assert_borrowed(&tcref).await;
         let encoded = destream_json::encode(tcref.clone()).expect("encode tcref for_each");
         let decoded: TCRef = destream_json::try_decode((), encoded)
             .await
