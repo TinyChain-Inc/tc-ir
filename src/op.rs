@@ -95,7 +95,7 @@ impl OpDef {
     /// Bind concrete references beneath this resource to its native `$self`.
     /// Replicated methods use this so their local writes are not forwarded again.
     pub fn reference_self(mut self, resource: &pathlink::Link) -> Self {
-        self.map_subjects(&mut |subject| {
+        crate::scalar::map_subjects(&mut self, &mut |subject| {
             if let Subject::Link(link) = subject {
                 if link.host() == resource.host() && link.path().starts_with(resource.path()) {
                     *subject = Subject::Ref(
@@ -111,7 +111,7 @@ impl OpDef {
     /// Bind `$self` operations to the owning resource's public invocation boundary.
     /// Composed methods use this so nested writes participate in replication.
     pub fn dereference_self(mut self, resource: &pathlink::Link) -> Self {
-        self.map_subjects(&mut |subject| {
+        crate::scalar::map_subjects(&mut self, &mut |subject| {
             if let Subject::Ref(id, suffix) = subject {
                 if id.as_str() == "self" {
                     let mut link = resource.clone();
@@ -123,17 +123,6 @@ impl OpDef {
             }
         });
         self
-    }
-
-    pub(crate) fn map_subjects(&mut self, visitor: &mut impl FnMut(&mut Subject)) {
-        let form = match self {
-            Self::Get((_, form)) | Self::Delete((_, form)) => form,
-            Self::Put((_, _, form)) => form,
-            Self::Post(form) => form,
-        };
-        for (_, scalar) in form {
-            scalar.map_subjects(visitor);
-        }
     }
 
     pub fn form(&self) -> &[(Id, Scalar)] {
@@ -197,27 +186,6 @@ pub(crate) fn bind(
 }
 
 impl OpRef {
-    pub(crate) fn map_subjects(&mut self, visitor: &mut impl FnMut(&mut Subject)) {
-        let subject = match self {
-            Self::Get((subject, key)) | Self::Delete((subject, key)) => {
-                key.map_subjects(visitor);
-                subject
-            }
-            Self::Put((subject, key, value)) => {
-                key.map_subjects(visitor);
-                value.map_subjects(visitor);
-                subject
-            }
-            Self::Post((subject, params)) => {
-                for scalar in params.values_mut() {
-                    scalar.map_subjects(visitor);
-                }
-                subject
-            }
-        };
-        visitor(subject);
-    }
-
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
         crate::scalar::collect_op_ref_requires(self, required)
     }

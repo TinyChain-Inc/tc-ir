@@ -31,6 +31,13 @@ are not application dependencies or authorization grants. Scheduling,
 missing-provider and cycle errors, bounded concurrency, deadlines, and `OpDef`
 execution belong to the runtime which consumes them.
 
+`OpDef::reference_self` binds same-resource Link subjects to `$self`;
+`dereference_self` binds `$self` subjects to an application Link. They recursively
+transform operation arguments in the IR owner without execution or serialization.
+The application owner chooses the binding appropriate to replication or composition.
+`Scalar::is_ref` distinguishes expressions from literal scalars and operation
+definitions, including expressions nested inside maps and tuples.
+
 ## Lexical scope
 
 An `OpDef` is an immutable, single-assignment lexical graph. Invocation inputs

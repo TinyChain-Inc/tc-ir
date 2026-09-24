@@ -94,31 +94,6 @@ impl ForEach {
 }
 
 impl TCRef {
-    pub(crate) fn map_subjects(&mut self, visitor: &mut impl FnMut(&mut crate::Subject)) {
-        match self {
-            Self::Op(op) => op.map_subjects(visitor),
-            Self::Id(_) => {}
-            Self::Cond(cond) => {
-                cond.cond.map_subjects(visitor);
-                cond.then.map_subjects(visitor);
-                cond.or_else.map_subjects(visitor);
-            }
-            Self::After(after) => {
-                after.when.map_subjects(visitor);
-                after.then.map_subjects(visitor);
-            }
-            Self::While(while_ref) => {
-                while_ref.cond.map_subjects(visitor);
-                while_ref.closure.map_subjects(visitor);
-                while_ref.state.map_subjects(visitor);
-            }
-            Self::ForEach(for_each) => {
-                for_each.items.map_subjects(visitor);
-                for_each.op.map_subjects(visitor);
-            }
-        }
-    }
-
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
         crate::scalar::collect_ref_requires(self, required)
     }
