@@ -31,6 +31,24 @@ pub enum Scalar {
 }
 
 impl Scalar {
+    pub(crate) fn map_subjects(&mut self, visitor: &mut impl FnMut(&mut Subject)) {
+        match self {
+            Self::Value(_) => {}
+            Self::Ref(reference) => reference.map_subjects(visitor),
+            Self::Op(op) => op.map_subjects(visitor),
+            Self::Map(map) => {
+                for scalar in map.values_mut() {
+                    scalar.map_subjects(visitor);
+                }
+            }
+            Self::Tuple(tuple) => {
+                for scalar in tuple {
+                    scalar.map_subjects(visitor);
+                }
+            }
+        }
+    }
+
     /// Add the lexical bindings required to resolve this scalar.
     ///
     /// This is a syntactic query. It neither resolves nor mutates a runtime
