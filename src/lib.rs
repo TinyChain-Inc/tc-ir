@@ -43,6 +43,35 @@ mod tests {
     #[derive(Clone)]
     struct FakeTxn;
 
+    #[test]
+    fn self_binding_recurses_through_operation_arguments() {
+        let resource: Link = "/service/example/counter/1.0.0".parse().unwrap();
+        let local = resource.clone().append("data".parse::<Id>().unwrap());
+        let external: Link = "/service/other/counter/1.0.0/data".parse().unwrap();
+        let op = OpDef::Put((
+            "key".parse().unwrap(),
+            "value".parse().unwrap(),
+            vec![(
+                "result".parse().unwrap(),
+                Scalar::from(TCRef::Op(OpRef::Put((
+                    Subject::Link(local.clone()),
+                    Scalar::default(),
+                    Scalar::from(TCRef::Op(OpRef::Get((
+                        Subject::Link(external.clone()),
+                        Scalar::default(),
+                    )))),
+                )))),
+            )],
+        ));
+        let bound = op.clone().reference_self(&resource);
+        let mut targets = Vec::new();
+        bound.form()[0]
+            .1
+            .visit_referenced_methods(&mut |link, _| targets.push(link.clone()));
+        assert_eq!(targets, vec![external]);
+        assert_eq!(bound.dereference_self(&resource), op);
+    }
+
     impl FakeTxn {
         fn new() -> Self {
             Self

@@ -31,6 +31,21 @@ pub enum Scalar {
 }
 
 impl Scalar {
+    /// Whether this value contains an expression requiring evaluation.
+    /// Operation definitions are literal closures, not evaluated expressions.
+    pub fn is_ref(&self) -> bool {
+        let mut pending = vec![self];
+        while let Some(scalar) = pending.pop() {
+            match scalar {
+                Self::Ref(_) => return true,
+                Self::Map(map) => pending.extend(map.values()),
+                Self::Tuple(tuple) => pending.extend(tuple),
+                Self::Value(_) | Self::Op(_) => {}
+            }
+        }
+        false
+    }
+
     /// Add the lexical bindings required to resolve this scalar.
     ///
     /// This is a syntactic query. It neither resolves nor mutates a runtime
@@ -62,6 +77,72 @@ impl Scalar {
                     scalar.visit_referenced_methods(visitor);
                 }
             }
+        }
+    }
+}
+
+// One iterative walk binds operation subjects, including nested arguments and
+// lexical closures, without using the native stack for untrusted graph depth.
+pub(crate) fn map_subjects(op: &mut crate::OpDef, visitor: &mut impl FnMut(&mut Subject)) {
+    enum Node<'a> {
+        Scalar(&'a mut Scalar),
+        Op(&'a mut crate::OpDef),
+        Ref(&'a mut crate::TCRef),
+    }
+    let mut pending = vec![Node::Op(op)];
+    while let Some(node) = pending.pop() {
+        match node {
+            Node::Op(op) => {
+                let form = match op {
+                    crate::OpDef::Get((_, form)) | crate::OpDef::Delete((_, form)) => form,
+                    crate::OpDef::Put((_, _, form)) | crate::OpDef::Post(form) => form,
+                };
+                pending.extend(form.iter_mut().map(|(_, scalar)| Node::Scalar(scalar)));
+            }
+            Node::Scalar(Scalar::Value(_)) => {}
+            Node::Scalar(Scalar::Op(op)) => pending.push(Node::Op(op)),
+            Node::Scalar(Scalar::Map(map)) => pending.extend(map.values_mut().map(Node::Scalar)),
+            Node::Scalar(Scalar::Tuple(tuple)) => {
+                pending.extend(tuple.iter_mut().map(Node::Scalar))
+            }
+            Node::Scalar(Scalar::Ref(reference)) => pending.push(Node::Ref(reference)),
+            Node::Ref(reference) => match reference {
+                crate::TCRef::Id(_) => {}
+                crate::TCRef::Op(op) => {
+                    let subject = match op {
+                        crate::OpRef::Get((subject, key))
+                        | crate::OpRef::Delete((subject, key)) => {
+                            pending.push(Node::Scalar(key));
+                            subject
+                        }
+                        crate::OpRef::Put((subject, key, value)) => {
+                            pending.extend([Node::Scalar(key), Node::Scalar(value)]);
+                            subject
+                        }
+                        crate::OpRef::Post((subject, params)) => {
+                            pending.extend(params.values_mut().map(Node::Scalar));
+                            subject
+                        }
+                    };
+                    visitor(subject);
+                }
+                crate::TCRef::Cond(c) => pending.extend([
+                    Node::Ref(&mut c.cond),
+                    Node::Scalar(&mut c.then),
+                    Node::Scalar(&mut c.or_else),
+                ]),
+                crate::TCRef::After(a) => {
+                    pending.extend([Node::Scalar(&mut a.when), Node::Scalar(&mut a.then)])
+                }
+                crate::TCRef::While(w) => pending.extend([
+                    Node::Scalar(&mut w.cond),
+                    Node::Scalar(&mut w.closure),
+                    Node::Scalar(&mut w.state),
+                ]),
+                crate::TCRef::ForEach(f) => {
+                    pending.extend([Node::Scalar(&mut f.items), Node::Scalar(&mut f.op)])
+                }
+            },
         }
     }
 }

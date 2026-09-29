@@ -92,6 +92,39 @@ pub enum OpDef {
 }
 
 impl OpDef {
+    /// Bind concrete references beneath this resource to its native `$self`.
+    /// Replicated methods use this so their local writes are not forwarded again.
+    pub fn reference_self(mut self, resource: &pathlink::Link) -> Self {
+        crate::scalar::map_subjects(&mut self, &mut |subject| {
+            if let Subject::Link(link) = subject {
+                if link.host() == resource.host() && link.path().starts_with(resource.path()) {
+                    *subject = Subject::Ref(
+                        crate::IdRef::new("self".parse().expect("self identifier")),
+                        PathBuf::from_slice(&link.path()[resource.path().len()..]),
+                    );
+                }
+            }
+        });
+        self
+    }
+
+    /// Bind `$self` operations to the owning resource's public invocation boundary.
+    /// Composed methods use this so nested writes participate in replication.
+    pub fn dereference_self(mut self, resource: &pathlink::Link) -> Self {
+        crate::scalar::map_subjects(&mut self, &mut |subject| {
+            if let Subject::Ref(id, suffix) = subject {
+                if id.as_str() == "self" {
+                    let mut link = resource.clone();
+                    for segment in suffix.iter() {
+                        link = link.append(segment.clone());
+                    }
+                    *subject = Subject::Link(link);
+                }
+            }
+        });
+        self
+    }
+
     pub fn form(&self) -> &[(Id, Scalar)] {
         match self {
             Self::Get((_, form)) => form,
