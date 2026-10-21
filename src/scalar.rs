@@ -4,43 +4,68 @@ use std::{fmt, str::FromStr};
 
 use async_hash::{Digest, Hash, Output};
 use destream::{de, en};
-use number_general::Number;
 use pathlink::{path_label, Link, PathBuf, PathLabel};
-use tc_error::{TCError, TCResult};
-use tc_value::{decode_typed_value_map_entry, Value};
 
-use crate::{Id, Map};
+use crate::{Id, Map, OpDef, OpRef, TCRef};
+use tc_error::{TCError, TCResult};
+use tc_value::Value;
 
 /// Scalar values exchanged via the TinyChain IR.
-///
-/// ## v1-compatible JSON semantics
-///
-/// This crate intentionally uses the v1 TinyChain reference encoding conventions when serialized
-/// via `destream_json`:
-///
-/// - A scalar value is encoded like a v1 scalar value (e.g. `null`, or a typed map like
-///   `{"\/state\/scalar\/value\/number": 3}`).
-/// - A reference is encoded as an op ref / TC ref map (see [`crate::OpRef`] and [`crate::TCRef`]).
-#[derive(Clone, Debug, PartialEq)]
+/// Native construction must respect the codec's structural nesting contract.
+#[derive(Clone, PartialEq)]
 pub enum Scalar {
     Value(Value),
-    Ref(Box<crate::tcref::TCRef>),
-    Op(crate::op::OpDef),
+    Ref(Box<crate::TCRef>),
+    Op(crate::OpDef),
     Map(Map<Scalar>),
     Tuple(Vec<Scalar>),
+}
+
+impl fmt::Debug for Scalar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Value(value) => write!(f, "Value({value:?})"),
+            Self::Ref(value) => write!(f, "Ref({value:?})"),
+            Self::Op(value) => write!(f, "Op({value:?})"),
+            Self::Tuple(values) => write!(f, "Tuple({values:?})"),
+            Self::Map(values) => write!(f, "Map({:?})", **values),
+        }
+    }
+}
+
+impl get_size::GetSize for Scalar {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Value(value) => value.get_heap_size(),
+            Self::Ref(value) => value.get_heap_size(),
+            Self::Op(value) => value.get_heap_size(),
+            Self::Map(values) => values.get_heap_size(),
+            Self::Tuple(values) => values.get_heap_size(),
+        }
+    }
 }
 
 impl Scalar {
     /// Whether this value contains an expression requiring evaluation.
     /// Operation definitions are literal closures, not evaluated expressions.
     pub fn is_ref(&self) -> bool {
-        let mut pending = vec![self];
-        while let Some(scalar) = pending.pop() {
-            match scalar {
-                Self::Ref(_) => return true,
-                Self::Map(map) => pending.extend(map.values()),
-                Self::Tuple(tuple) => pending.extend(tuple),
-                Self::Value(_) | Self::Op(_) => {}
+        let mut pending = vec![QueryNode::Scalar(self)];
+        while let Some(node) = pending.pop() {
+            match node {
+                QueryNode::Children(mut children) => {
+                    if let Some((_, value)) = children.next() {
+                        pending.push(QueryNode::Children(children));
+                        pending.push(QueryNode::Scalar(value));
+                    }
+                }
+                QueryNode::Scalar(Scalar::Ref(_)) => return true,
+                QueryNode::Scalar(Scalar::Map(map)) => {
+                    pending.push(QueryNode::Children(Children::Map(map.iter())))
+                }
+                QueryNode::Scalar(Scalar::Tuple(tuple)) => {
+                    pending.push(QueryNode::Children(Children::Tuple(tuple.iter())))
+                }
+                _ => {}
             }
         }
         false
@@ -51,7 +76,7 @@ impl Scalar {
     /// This is a syntactic query. It neither resolves nor mutates a runtime
     /// namespace; the caller owns the request-local accumulator.
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
-        collect_requires(RequireNode::Scalar(self), required)
+        collect_requires(QueryNode::Scalar(self), required)
     }
 
     /// Visit each method invoked on a concrete link in this scalar.
@@ -59,25 +84,7 @@ impl Scalar {
     /// This reports syntax only. The caller owns classification, aggregation,
     /// ordering, and policy.
     pub fn visit_referenced_methods(&self, visitor: &mut impl FnMut(&Link, crate::Method)) {
-        match self {
-            Self::Value(_) => {}
-            Self::Ref(reference) => reference.visit_referenced_methods(visitor),
-            Self::Op(op) => {
-                for (_, scalar) in op.form() {
-                    scalar.visit_referenced_methods(visitor);
-                }
-            }
-            Self::Map(map) => {
-                for scalar in map.values() {
-                    scalar.visit_referenced_methods(visitor);
-                }
-            }
-            Self::Tuple(tuple) => {
-                for scalar in tuple {
-                    scalar.visit_referenced_methods(visitor);
-                }
-            }
-        }
+        visit_methods(self, visitor)
     }
 }
 
@@ -88,23 +95,42 @@ pub(crate) fn map_subjects(op: &mut crate::OpDef, visitor: &mut impl FnMut(&mut 
         Scalar(&'a mut Scalar),
         Op(&'a mut crate::OpDef),
         Ref(&'a mut crate::TCRef),
+        Map(std::collections::btree_map::ValuesMut<'a, Id, Scalar>),
+        Tuple(std::slice::IterMut<'a, Scalar>),
+        Form(std::slice::IterMut<'a, (Id, Scalar)>),
     }
     let mut pending = vec![Node::Op(op)];
     while let Some(node) = pending.pop() {
         match node {
+            Node::Map(mut items) => {
+                if let Some(value) = items.next_back() {
+                    pending.push(Node::Map(items));
+                    pending.push(Node::Scalar(value));
+                }
+            }
+            Node::Tuple(mut items) => {
+                if let Some(value) = items.next_back() {
+                    pending.push(Node::Tuple(items));
+                    pending.push(Node::Scalar(value));
+                }
+            }
+            Node::Form(mut items) => {
+                if let Some((_, value)) = items.next_back() {
+                    pending.push(Node::Form(items));
+                    pending.push(Node::Scalar(value));
+                }
+            }
             Node::Op(op) => {
                 let form = match op {
                     crate::OpDef::Get((_, form)) | crate::OpDef::Delete((_, form)) => form,
                     crate::OpDef::Put((_, _, form)) | crate::OpDef::Post(form) => form,
                 };
-                pending.extend(form.iter_mut().map(|(_, scalar)| Node::Scalar(scalar)));
+                pending.push(Node::Form(form.iter_mut()));
             }
             Node::Scalar(Scalar::Value(_)) => {}
             Node::Scalar(Scalar::Op(op)) => pending.push(Node::Op(op)),
-            Node::Scalar(Scalar::Map(map)) => pending.extend(map.values_mut().map(Node::Scalar)),
-            Node::Scalar(Scalar::Tuple(tuple)) => {
-                pending.extend(tuple.iter_mut().map(Node::Scalar))
-            }
+            Node::Scalar(Scalar::Map(map)) => pending.push(Node::Map(map.values_mut())),
+            Node::Scalar(Scalar::Tuple(tuple)) => pending.push(Node::Tuple(tuple.iter_mut())),
             Node::Scalar(Scalar::Ref(reference)) => pending.push(Node::Ref(reference)),
             Node::Ref(reference) => match reference {
                 crate::TCRef::Id(_) => {}
@@ -120,7 +146,7 @@ pub(crate) fn map_subjects(op: &mut crate::OpDef, visitor: &mut impl FnMut(&mut 
                             subject
                         }
                         crate::OpRef::Post((subject, params)) => {
-                            pending.extend(params.values_mut().map(Node::Scalar));
+                            pending.push(Node::Map(params.values_mut()));
                             subject
                         }
                     };
@@ -147,36 +173,37 @@ pub(crate) fn map_subjects(op: &mut crate::OpDef, visitor: &mut impl FnMut(&mut 
     }
 }
 
-enum ValidateNode<'a> {
-    Scalar(&'a Scalar),
-    Ref(&'a crate::TCRef),
-    OpRef(&'a crate::OpRef),
-    OpDef(&'a crate::OpDef),
-}
-
 pub(crate) fn validate_op(op: &crate::OpDef, visible: &BTreeSet<Id>) -> TCResult<()> {
-    let mut pending = vec![(ValidateNode::OpDef(op), Arc::new(visible.clone()))];
+    let mut pending = Vec::new();
+    pending
+        .try_reserve(1)
+        .map_err(|err| TCError::internal(format!("cannot reserve validation frames: {err}")))?;
+    pending.push((QueryNode::OpDef(op), Arc::new(visible.clone())));
     while let Some((node, visible)) = pending.pop() {
+        pending
+            .try_reserve(3)
+            .map_err(|err| TCError::internal(format!("cannot reserve validation frames: {err}")))?;
         match node {
-            ValidateNode::Scalar(Scalar::Value(_)) => {}
-            ValidateNode::Scalar(Scalar::Ref(reference)) => {
-                pending.push((ValidateNode::Ref(reference), visible));
+            QueryNode::Children(mut children) => {
+                if let Some((_, value)) = children.next() {
+                    pending.push((QueryNode::Children(children), Arc::clone(&visible)));
+                    pending.push((QueryNode::Scalar(value), visible));
+                }
             }
-            ValidateNode::Scalar(Scalar::Op(op)) => {
-                pending.push((ValidateNode::OpDef(op), visible));
+            QueryNode::Scalar(Scalar::Value(_)) => {}
+            QueryNode::Scalar(Scalar::Ref(reference)) => {
+                pending.push((QueryNode::Ref(reference), visible));
             }
-            ValidateNode::Scalar(Scalar::Map(map)) => pending.extend(
-                map.values()
-                    .rev()
-                    .map(|scalar| (ValidateNode::Scalar(scalar), Arc::clone(&visible))),
-            ),
-            ValidateNode::Scalar(Scalar::Tuple(tuple)) => pending.extend(
-                tuple
-                    .iter()
-                    .rev()
-                    .map(|scalar| (ValidateNode::Scalar(scalar), Arc::clone(&visible))),
-            ),
-            ValidateNode::OpDef(op) => {
+            QueryNode::Scalar(Scalar::Op(op)) => {
+                pending.push((QueryNode::OpDef(op), visible));
+            }
+            QueryNode::Scalar(Scalar::Map(map)) => {
+                pending.push((QueryNode::Children(Children::Map(map.iter())), visible))
+            }
+            QueryNode::Scalar(Scalar::Tuple(tuple)) => {
+                pending.push((QueryNode::Children(Children::Tuple(tuple.iter())), visible))
+            }
+            QueryNode::OpDef(op) => {
                 if op.form().is_empty() {
                     return Err(TCError::bad_request(
                         "an OpDef must define at least one provider",
@@ -198,28 +225,23 @@ pub(crate) fn validate_op(op: &crate::OpDef, visible: &BTreeSet<Id>) -> TCResult
                     crate::op::bind(&mut scope, &mut local, id, "provider")?;
                 }
                 let scope = Arc::new(scope);
-                pending.extend(
-                    op.form()
-                        .iter()
-                        .rev()
-                        .map(|(_, scalar)| (ValidateNode::Scalar(scalar), Arc::clone(&scope))),
-                );
+                pending.push((QueryNode::Children(Children::Form(op.form().iter())), scope));
             }
-            ValidateNode::Ref(crate::TCRef::Id(_)) => {}
-            ValidateNode::Ref(crate::TCRef::Op(op)) => {
-                pending.push((ValidateNode::OpRef(op), visible));
+            QueryNode::Ref(crate::TCRef::Id(_)) => {}
+            QueryNode::Ref(crate::TCRef::Op(op)) => {
+                pending.push((QueryNode::OpRef(op), visible));
             }
-            ValidateNode::Ref(crate::TCRef::Cond(cond)) => {
-                pending.push((ValidateNode::Scalar(&cond.or_else), Arc::clone(&visible)));
-                pending.push((ValidateNode::Scalar(&cond.then), Arc::clone(&visible)));
-                pending.push((ValidateNode::Ref(&cond.cond), visible));
+            QueryNode::Ref(crate::TCRef::Cond(cond)) => {
+                pending.push((QueryNode::Scalar(&cond.or_else), Arc::clone(&visible)));
+                pending.push((QueryNode::Scalar(&cond.then), Arc::clone(&visible)));
+                pending.push((QueryNode::Ref(&cond.cond), visible));
             }
-            ValidateNode::Ref(crate::TCRef::After(after)) => {
-                pending.push((ValidateNode::Scalar(&after.then), Arc::clone(&visible)));
-                pending.push((ValidateNode::Scalar(&after.when), visible));
+            QueryNode::Ref(crate::TCRef::After(after)) => {
+                pending.push((QueryNode::Scalar(&after.then), Arc::clone(&visible)));
+                pending.push((QueryNode::Scalar(&after.when), visible));
             }
-            ValidateNode::Ref(crate::TCRef::While(while_ref)) => {
-                pending.push((ValidateNode::Scalar(&while_ref.state), Arc::clone(&visible)));
+            QueryNode::Ref(crate::TCRef::While(while_ref)) => {
+                pending.push((QueryNode::Scalar(&while_ref.state), Arc::clone(&visible)));
                 let mut callback = (*visible).clone();
                 crate::op::bind(
                     &mut callback,
@@ -228,14 +250,11 @@ pub(crate) fn validate_op(op: &crate::OpDef, visible: &BTreeSet<Id>) -> TCResult
                     "While callback parameter",
                 )?;
                 let callback = Arc::new(callback);
-                pending.push((
-                    ValidateNode::Scalar(&while_ref.closure),
-                    Arc::clone(&callback),
-                ));
-                pending.push((ValidateNode::Scalar(&while_ref.cond), callback));
+                pending.push((QueryNode::Scalar(&while_ref.closure), Arc::clone(&callback)));
+                pending.push((QueryNode::Scalar(&while_ref.cond), callback));
             }
-            ValidateNode::Ref(crate::TCRef::ForEach(for_each)) => {
-                pending.push((ValidateNode::Scalar(&for_each.items), Arc::clone(&visible)));
+            QueryNode::Ref(crate::TCRef::ForEach(for_each)) => {
+                pending.push((QueryNode::Scalar(&for_each.items), Arc::clone(&visible)));
                 let mut body = (*visible).clone();
                 crate::op::bind(
                     &mut body,
@@ -243,27 +262,44 @@ pub(crate) fn validate_op(op: &crate::OpDef, visible: &BTreeSet<Id>) -> TCResult
                     &for_each.item_name,
                     "ForEach item",
                 )?;
-                pending.push((ValidateNode::Scalar(&for_each.op), Arc::new(body)));
+                pending.push((QueryNode::Scalar(&for_each.op), Arc::new(body)));
             }
-            ValidateNode::OpRef(op) => {
-                let scalars: Vec<&Scalar> = match op {
-                    crate::OpRef::Get((_, key)) | crate::OpRef::Delete((_, key)) => vec![key],
-                    crate::OpRef::Put((_, key, value)) => vec![key, value],
-                    crate::OpRef::Post((_, params)) => params.values().collect(),
-                };
-                pending.extend(
-                    scalars
-                        .into_iter()
-                        .rev()
-                        .map(|scalar| (ValidateNode::Scalar(scalar), Arc::clone(&visible))),
-                );
-            }
+            QueryNode::OpRef(op) => match op {
+                crate::OpRef::Get((_, key)) | crate::OpRef::Delete((_, key)) => {
+                    pending.push((QueryNode::Scalar(key), visible))
+                }
+                crate::OpRef::Put((_, key, value)) => {
+                    pending.push((QueryNode::Scalar(value), Arc::clone(&visible)));
+                    pending.push((QueryNode::Scalar(key), visible));
+                }
+                crate::OpRef::Post((_, params)) => {
+                    pending.push((QueryNode::Children(Children::Map(params.iter())), visible))
+                }
+            },
         }
     }
     Ok(())
 }
 
-enum RequireNode<'a> {
+enum Children<'a> {
+    Tuple(std::slice::Iter<'a, Scalar>),
+    Map(std::collections::btree_map::Iter<'a, Id, Scalar>),
+    Form(std::slice::Iter<'a, (Id, Scalar)>),
+}
+
+impl<'a> Iterator for Children<'a> {
+    type Item = (Option<&'a Id>, &'a Scalar);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Tuple(items) => items.next().map(|value| (None, value)),
+            Self::Map(items) => items.next().map(|(id, value)| (Some(id), value)),
+            Self::Form(items) => items.next().map(|(id, value)| (Some(id), value)),
+        }
+    }
+}
+
+enum QueryNode<'a> {
+    Children(Children<'a>),
     Scalar(&'a Scalar),
     Ref(&'a crate::TCRef),
     OpRef(&'a crate::OpRef),
@@ -271,44 +307,41 @@ enum RequireNode<'a> {
 }
 
 pub(crate) fn collect_op_requires(op: &crate::OpDef, required: &mut BTreeSet<Id>) {
-    collect_requires(RequireNode::OpDef(op), required)
+    collect_requires(QueryNode::OpDef(op), required)
 }
 
 pub(crate) fn collect_op_ref_requires(op: &crate::OpRef, required: &mut BTreeSet<Id>) {
-    collect_requires(RequireNode::OpRef(op), required)
+    collect_requires(QueryNode::OpRef(op), required)
 }
 
 pub(crate) fn collect_ref_requires(reference: &crate::TCRef, required: &mut BTreeSet<Id>) {
-    collect_requires(RequireNode::Ref(reference), required)
+    collect_requires(QueryNode::Ref(reference), required)
 }
 
-fn collect_requires(initial: RequireNode<'_>, required: &mut BTreeSet<Id>) {
+fn collect_requires(initial: QueryNode<'_>, required: &mut BTreeSet<Id>) {
     let mut pending = vec![(initial, Arc::new(BTreeSet::new()))];
     while let Some((node, bound)) = pending.pop() {
         match node {
-            RequireNode::Scalar(Scalar::Value(_)) => {}
-            RequireNode::Scalar(Scalar::Ref(reference)) => {
-                pending.push((RequireNode::Ref(reference), bound));
+            QueryNode::Children(mut children) => {
+                if let Some((_, value)) = children.next() {
+                    pending.push((QueryNode::Children(children), Arc::clone(&bound)));
+                    pending.push((QueryNode::Scalar(value), bound));
+                }
             }
-            RequireNode::Scalar(Scalar::Op(op)) => {
-                pending.push((RequireNode::OpDef(op), bound));
+            QueryNode::Scalar(Scalar::Value(_)) => {}
+            QueryNode::Scalar(Scalar::Ref(reference)) => {
+                pending.push((QueryNode::Ref(reference), bound));
             }
-            RequireNode::Scalar(Scalar::Map(map)) => {
-                pending.extend(
-                    map.values()
-                        .rev()
-                        .map(|scalar| (RequireNode::Scalar(scalar), Arc::clone(&bound))),
-                );
+            QueryNode::Scalar(Scalar::Op(op)) => {
+                pending.push((QueryNode::OpDef(op), bound));
             }
-            RequireNode::Scalar(Scalar::Tuple(tuple)) => {
-                pending.extend(
-                    tuple
-                        .iter()
-                        .rev()
-                        .map(|scalar| (RequireNode::Scalar(scalar), Arc::clone(&bound))),
-                );
+            QueryNode::Scalar(Scalar::Map(map)) => {
+                pending.push((QueryNode::Children(Children::Map(map.iter())), bound))
             }
-            RequireNode::OpDef(op) => {
+            QueryNode::Scalar(Scalar::Tuple(tuple)) => {
+                pending.push((QueryNode::Children(Children::Tuple(tuple.iter())), bound))
+            }
+            QueryNode::OpDef(op) => {
                 let mut local = (*bound).clone();
                 match op {
                     crate::OpDef::Get((key, _)) | crate::OpDef::Delete((key, _)) => {
@@ -322,66 +355,63 @@ fn collect_requires(initial: RequireNode<'_>, required: &mut BTreeSet<Id>) {
                 }
                 local.extend(op.form().iter().map(|(id, _)| id.clone()));
                 let local = Arc::new(local);
-                pending.extend(
-                    op.form()
-                        .iter()
-                        .rev()
-                        .map(|(_, scalar)| (RequireNode::Scalar(scalar), Arc::clone(&local))),
-                );
+                pending.push((QueryNode::Children(Children::Form(op.form().iter())), local));
             }
-            RequireNode::Ref(crate::TCRef::Id(id)) => {
+            QueryNode::Ref(crate::TCRef::Id(id)) => {
                 if id.as_str() != "self" && !bound.contains(id.id()) {
                     required.insert(id.id().clone());
                 }
             }
-            RequireNode::Ref(crate::TCRef::Op(op)) => {
-                pending.push((RequireNode::OpRef(op), bound));
+            QueryNode::Ref(crate::TCRef::Op(op)) => {
+                pending.push((QueryNode::OpRef(op), bound));
             }
-            RequireNode::Ref(crate::TCRef::Cond(cond)) => {
-                pending.push((RequireNode::Scalar(&cond.or_else), Arc::clone(&bound)));
-                pending.push((RequireNode::Scalar(&cond.then), Arc::clone(&bound)));
-                pending.push((RequireNode::Ref(&cond.cond), bound));
+            QueryNode::Ref(crate::TCRef::Cond(cond)) => {
+                pending.push((QueryNode::Scalar(&cond.or_else), Arc::clone(&bound)));
+                pending.push((QueryNode::Scalar(&cond.then), Arc::clone(&bound)));
+                pending.push((QueryNode::Ref(&cond.cond), bound));
             }
-            RequireNode::Ref(crate::TCRef::After(after)) => {
-                pending.push((RequireNode::Scalar(&after.then), Arc::clone(&bound)));
-                pending.push((RequireNode::Scalar(&after.when), bound));
+            QueryNode::Ref(crate::TCRef::After(after)) => {
+                pending.push((QueryNode::Scalar(&after.then), Arc::clone(&bound)));
+                pending.push((QueryNode::Scalar(&after.when), bound));
             }
-            RequireNode::Ref(crate::TCRef::While(while_ref)) => {
-                pending.push((RequireNode::Scalar(&while_ref.state), Arc::clone(&bound)));
+            QueryNode::Ref(crate::TCRef::While(while_ref)) => {
+                pending.push((QueryNode::Scalar(&while_ref.state), Arc::clone(&bound)));
                 let mut callback = (*bound).clone();
                 callback.insert("state".parse().expect("reserved callback Id"));
                 let callback = Arc::new(callback);
-                pending.push((
-                    RequireNode::Scalar(&while_ref.closure),
-                    Arc::clone(&callback),
-                ));
-                pending.push((RequireNode::Scalar(&while_ref.cond), callback));
+                pending.push((QueryNode::Scalar(&while_ref.closure), Arc::clone(&callback)));
+                pending.push((QueryNode::Scalar(&while_ref.cond), callback));
             }
-            RequireNode::Ref(crate::TCRef::ForEach(for_each)) => {
-                pending.push((RequireNode::Scalar(&for_each.items), Arc::clone(&bound)));
+            QueryNode::Ref(crate::TCRef::ForEach(for_each)) => {
+                pending.push((QueryNode::Scalar(&for_each.items), Arc::clone(&bound)));
                 let mut body = (*bound).clone();
                 body.insert(for_each.item_name.clone());
-                pending.push((RequireNode::Scalar(&for_each.op), Arc::new(body)));
+                pending.push((QueryNode::Scalar(&for_each.op), Arc::new(body)));
             }
-            RequireNode::OpRef(op) => {
-                let (subject, scalars): (&crate::Subject, Vec<&Scalar>) = match op {
+            QueryNode::OpRef(op) => {
+                let subject = match op {
                     crate::OpRef::Get((subject, key)) | crate::OpRef::Delete((subject, key)) => {
-                        (subject, vec![key])
+                        pending.push((QueryNode::Scalar(key), Arc::clone(&bound)));
+                        subject
                     }
-                    crate::OpRef::Put((subject, key, value)) => (subject, vec![key, value]),
-                    crate::OpRef::Post((subject, params)) => (subject, params.values().collect()),
+                    crate::OpRef::Put((subject, key, value)) => {
+                        pending.push((QueryNode::Scalar(value), Arc::clone(&bound)));
+                        pending.push((QueryNode::Scalar(key), Arc::clone(&bound)));
+                        subject
+                    }
+                    crate::OpRef::Post((subject, params)) => {
+                        pending.push((
+                            QueryNode::Children(Children::Map(params.iter())),
+                            Arc::clone(&bound),
+                        ));
+                        subject
+                    }
                 };
                 if let crate::Subject::Ref(id, _) = subject {
                     if id.as_str() != "self" && !bound.contains(id.id()) {
                         required.insert(id.id().clone());
                     }
                 }
-                pending.extend(
-                    scalars
-                        .into_iter()
-                        .rev()
-                        .map(|scalar| (RequireNode::Scalar(scalar), Arc::clone(&bound))),
-                );
             }
         }
     }
@@ -397,10 +427,10 @@ impl<D: Digest> Hash<D> for &Scalar {
     fn hash(self) -> Output<D> {
         match self {
             Scalar::Value(value) => Hash::<D>::hash(value),
-            Scalar::Ref(reference) => Hash::<D>::hash(reference.as_ref()),
-            Scalar::Op(op) => Hash::<D>::hash(op),
-            Scalar::Map(map) => Hash::<D>::hash(map),
-            Scalar::Tuple(tuple) => Hash::<D>::hash(tuple),
+            Scalar::Ref(value) => Hash::<D>::hash(value.as_ref()),
+            Scalar::Op(value) => Hash::<D>::hash(value),
+            Scalar::Map(values) => Hash::<D>::hash(values),
+            Scalar::Tuple(values) => Hash::<D>::hash(values),
         }
     }
 }
@@ -408,6 +438,12 @@ impl<D: Digest> Hash<D> for &Scalar {
 /// A reference to a named value in a scope (e.g. "$self").
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct IdRef(Id);
+
+impl get_size::GetSize for IdRef {
+    fn get_heap_size(&self) -> usize {
+        self.0.get_heap_size()
+    }
+}
 
 impl IdRef {
     pub fn new(id: Id) -> Self {
@@ -449,10 +485,9 @@ impl From<IdRef> for Id {
 
 /// The subject of an op.
 ///
-/// Copied from the v1 `OpRef` model: an op may target either a concrete [`Link`] or a scoped
-/// reference plus a suffix path.
+/// An op targets either a concrete [`Link`] or a scoped reference plus a suffix path.
 ///
-/// ## v1-compatible JSON semantics
+/// ## Wire representation
 ///
 /// Encoded as a string:
 ///
@@ -462,6 +497,15 @@ impl From<IdRef> for Id {
 pub enum Subject {
     Link(Link),
     Ref(IdRef, PathBuf),
+}
+
+impl get_size::GetSize for Subject {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Link(link) => link.get_heap_size(),
+            Self::Ref(id, path) => id.get_heap_size() + path.get_heap_size(),
+        }
+    }
 }
 
 pub const SCALAR_REF_PREFIX: PathLabel = path_label(&["state", "scalar", "ref"]);
@@ -559,181 +603,6 @@ impl<'en> en::ToStream<'en> for Subject {
     }
 }
 
-impl de::FromStream for Scalar {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct ScalarVisitor;
-
-        impl de::Visitor for ScalarVisitor {
-            type Value = Scalar;
-
-            fn expecting() -> &'static str {
-                "a Scalar"
-            }
-
-            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::None))
-            }
-
-            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::None))
-            }
-
-            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::Number(Number::from(value))))
-            }
-
-            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::Number(Number::from(value))))
-            }
-
-            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::Number(Number::from(value))))
-            }
-
-            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::Number(Number::from(value))))
-            }
-
-            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(Scalar::Value(Value::String(value)))
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut items: Vec<Scalar> = if let Some(size) = seq.size_hint() {
-                    Vec::with_capacity(size)
-                } else {
-                    Vec::new()
-                };
-
-                while let Some(value) = seq.next_element::<Scalar>(()).await? {
-                    items.push(value);
-                }
-
-                Ok(Scalar::Tuple(items))
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let Some(key) = map.next_key::<String>(()).await? else {
-                    return Ok(Scalar::Map(Map::new()));
-                };
-
-                if key.starts_with('/') {
-                    if let Some(value) = decode_typed_value_map_entry(&key, &mut map).await? {
-                        return Ok(Scalar::Value(value));
-                    }
-
-                    let key_path = PathBuf::from_str(&key).ok();
-
-                    if let Some(path) = key_path.as_ref() {
-                        if let Some(op_def_type) = crate::op::OpDefType::from_path(path) {
-                            let op_def =
-                                crate::op::decode_opdef_map_entry(op_def_type, &mut map).await?;
-                            return Ok(Scalar::Op(op_def));
-                        }
-
-                        if is_tcref_or_opref_path(path) {
-                            let r = crate::tcref::decode_tcref_map_entry(key, &mut map).await?;
-                            return Ok(Scalar::Ref(Box::new(r)));
-                        }
-                    }
-
-                    let args = map.next_value::<crate::op::OpArgs>(()).await?;
-                    if let crate::op::OpArgs::Seq(items) = &args {
-                        if items.is_empty() {
-                            if let Ok(link) = Link::from_str(&key) {
-                                while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                                    let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                                }
-                                return Ok(Scalar::Value(Value::Link(link)));
-                            }
-                        }
-                    }
-
-                    let subject =
-                        subject_from_str(&key).map_err(|err| de::Error::custom(err.to_string()))?;
-                    let op = crate::op::opref_from_subject_args::<A::Error>(subject, args)?;
-                    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                        let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                    }
-                    return Ok(Scalar::Ref(Box::new(crate::tcref::TCRef::Op(op))));
-                }
-
-                if key.starts_with('$') {
-                    let r = crate::tcref::decode_tcref_map_entry(key, &mut map).await?;
-                    return Ok(Scalar::Ref(Box::new(r)));
-                }
-
-                let mut out = Map::new();
-                let value = map.next_value::<Scalar>(()).await?;
-                let id: Id = key
-                    .parse::<Id>()
-                    .map_err(|err| de::Error::custom(err.to_string()))?;
-                out.insert(id, value);
-
-                while let Some(key) = map.next_key::<String>(()).await? {
-                    let value = map.next_value::<Scalar>(()).await?;
-                    let id: Id = key
-                        .parse::<Id>()
-                        .map_err(|err| de::Error::custom(err.to_string()))?;
-                    if out.insert(id.clone(), value).is_some() {
-                        return Err(de::Error::custom(format!("duplicate map key {id}")));
-                    }
-                }
-
-                Ok(Scalar::Map(out))
-            }
-        }
-
-        decoder.decode_any(ScalarVisitor).await
-    }
-}
-
-impl<'en> en::IntoStream<'en> for Scalar {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Scalar::Value(value) => value.into_stream(encoder),
-            Scalar::Ref(r) => (*r).into_stream(encoder),
-            Scalar::Op(op) => op.into_stream(encoder),
-            Scalar::Map(map) => map.into_stream(encoder),
-            Scalar::Tuple(tuple) => tuple.into_stream(encoder),
-        }
-    }
-}
-
-impl<'en> en::ToStream<'en> for Scalar {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Self::Value(value) => value.to_stream(encoder),
-            Self::Ref(reference) => reference.to_stream(encoder),
-            Self::Op(op) => op.to_stream(encoder),
-            Self::Map(map) => map.to_stream(encoder),
-            Self::Tuple(tuple) => tuple.to_stream(encoder),
-        }
-    }
-}
-
-fn is_tcref_or_opref_path(path: &PathBuf) -> bool {
-    path == &PathBuf::from(TCREF_COND)
-        || path == &PathBuf::from(TCREF_AFTER)
-        || path == &PathBuf::from(TCREF_WHILE)
-        || path == &PathBuf::from(TCREF_FOR_EACH)
-        || path == &PathBuf::from(OPREF_GET)
-        || path == &PathBuf::from(OPREF_PUT)
-        || path == &PathBuf::from(OPREF_POST)
-        || path == &PathBuf::from(OPREF_DELETE)
-}
-
 pub(crate) fn subject_from_str(s: &str) -> Result<Subject, TCError> {
     if s.starts_with('$') {
         if let Some(i) = s.find('/') {
@@ -755,7 +624,7 @@ pub(crate) fn subject_from_str(s: &str) -> Result<Subject, TCError> {
 
 impl Default for Scalar {
     fn default() -> Self {
-        Scalar::Value(Value::default())
+        Value::default().into()
     }
 }
 
@@ -765,44 +634,151 @@ impl From<Value> for Scalar {
     }
 }
 
-impl From<crate::tcref::TCRef> for Scalar {
-    fn from(value: crate::tcref::TCRef) -> Self {
+impl From<crate::TCRef> for Scalar {
+    fn from(value: crate::TCRef) -> Self {
         Scalar::Ref(Box::new(value))
     }
 }
 
-impl From<crate::op::OpDef> for Scalar {
-    fn from(value: crate::op::OpDef) -> Self {
+impl From<crate::OpDef> for Scalar {
+    fn from(value: crate::OpDef) -> Self {
         Scalar::Op(value)
     }
 }
 
 impl From<u64> for Scalar {
     fn from(value: u64) -> Self {
-        Scalar::Value(Value::from(value))
+        Value::from(value).into()
     }
 }
 
 impl safecast::TryCastFrom<Scalar> for Value {
     fn can_cast_from(scalar: &Scalar) -> bool {
-        match scalar {
-            Scalar::Value(_) => true,
-            Scalar::Tuple(items) => items.iter().all(Self::can_cast_from),
-            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) => false,
+        let mut pending = vec![std::slice::from_ref(scalar).iter()];
+        while let Some(items) = pending.last_mut() {
+            match items.next() {
+                Some(Scalar::Value(value)) => {
+                    if !value.within_depth(tc_value::MAX_VALUE_DEPTH - (pending.len() - 1)) {
+                        return false;
+                    }
+                }
+                Some(Scalar::Tuple(items)) => {
+                    if pending.len() > tc_value::MAX_VALUE_DEPTH {
+                        return false;
+                    }
+                    pending.push(items.iter());
+                }
+                Some(_) => return false,
+                None => {
+                    pending.pop();
+                }
+            }
         }
+        true
     }
 
     fn opt_cast_from(scalar: Scalar) -> Option<Self> {
-        match scalar {
-            Scalar::Value(value) => Some(value),
-            Scalar::Tuple(items) => {
-                let values = items
-                    .into_iter()
-                    .map(Self::opt_cast_from)
-                    .collect::<Option<Vec<_>>>()?;
-                Some(Value::Tuple(values))
+        if !Self::can_cast_from(&scalar) {
+            return None;
+        }
+
+        scalar_into_value(scalar)
+    }
+}
+
+// The caller validates the complete shape, including embedded Values, once.
+fn scalar_into_value(scalar: Scalar) -> Option<Value> {
+    match scalar {
+        Scalar::Value(value) => Some(value),
+        Scalar::Tuple(items) => items
+            .into_iter()
+            .map(scalar_into_value)
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Tuple),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MethodNode<'a> {
+    Scalar(&'a Scalar),
+    Ref(&'a TCRef),
+    Op(&'a OpDef),
+    Call(&'a OpRef),
+}
+
+enum MethodChildren<'a> {
+    Fixed(std::array::IntoIter<Option<MethodNode<'a>>, 3>),
+    Tuple(std::slice::Iter<'a, Scalar>),
+    Map(std::collections::btree_map::Iter<'a, Id, Scalar>),
+    Form(std::slice::Iter<'a, (Id, Scalar)>),
+}
+
+impl<'a> Iterator for MethodChildren<'a> {
+    type Item = (Option<&'a Id>, MethodNode<'a>);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Fixed(items) => items.flatten().next().map(|node| (None, node)),
+            Self::Tuple(items) => items.next().map(|value| (None, MethodNode::Scalar(value))),
+            Self::Map(items) => items
+                .next()
+                .map(|(key, value)| (Some(key), MethodNode::Scalar(value))),
+            Self::Form(items) => items
+                .next()
+                .map(|(key, value)| (Some(key), MethodNode::Scalar(value))),
+        }
+    }
+}
+
+fn method_children(node: MethodNode<'_>) -> MethodChildren<'_> {
+    use MethodNode::{Call as C, Op as O, Ref as R, Scalar as S};
+    let fields = match node {
+        S(value) => match &value {
+            Scalar::Value(_) => [None, None, None],
+            Scalar::Ref(value) => [Some(R(value)), None, None],
+            Scalar::Op(value) => [Some(O(value)), None, None],
+            Scalar::Map(values) => return MethodChildren::Map(values.iter()),
+            Scalar::Tuple(values) => return MethodChildren::Tuple(values.iter()),
+        },
+        R(value) => match &value {
+            TCRef::Id(_) => [None, None, None],
+            TCRef::Op(value) => [Some(C(value)), None, None],
+            TCRef::Cond(v) => [Some(R(&v.cond)), Some(S(&v.then)), Some(S(&v.or_else))],
+            TCRef::After(v) => [Some(S(&v.when)), Some(S(&v.then)), None],
+            TCRef::While(v) => [Some(S(&v.cond)), Some(S(&v.closure)), Some(S(&v.state))],
+            TCRef::ForEach(v) => [Some(S(&v.items)), Some(S(&v.op)), None],
+        },
+        O(value) => return MethodChildren::Form(value.form().iter()),
+        C(value) => match value {
+            OpRef::Get((_, key)) | OpRef::Delete((_, key)) => [Some(S(key)), None, None],
+            OpRef::Put((_, key, value)) => [Some(S(key)), Some(S(value)), None],
+            OpRef::Post((_, params)) => return MethodChildren::Map(params.iter()),
+        },
+    };
+    MethodChildren::Fixed(fields.into_iter())
+}
+
+fn visit_methods(root: &Scalar, visitor: &mut impl FnMut(&pathlink::Link, crate::Method)) {
+    let mut frames = vec![(
+        MethodNode::Scalar(root),
+        method_children(MethodNode::Scalar(root)),
+    )];
+    while let Some((_, children)) = frames.last_mut() {
+        if let Some((_, next)) = children.next() {
+            frames.push((next, method_children(next)));
+            continue;
+        }
+        let (node, _) = frames.pop().unwrap();
+        if let MethodNode::Call(op) = node {
+            let (subject, method) = match op {
+                OpRef::Get((s, _)) => (s, crate::Method::Get),
+                OpRef::Put((s, _, _)) => (s, crate::Method::Put),
+                OpRef::Post((s, _)) => (s, crate::Method::Post),
+                OpRef::Delete((s, _)) => (s, crate::Method::Delete),
+            };
+            if let Subject::Link(link) = subject {
+                visitor(link, method);
             }
-            Scalar::Map(_) | Scalar::Ref(_) | Scalar::Op(_) => None,
         }
     }
 }

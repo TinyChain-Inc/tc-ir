@@ -19,6 +19,19 @@ resolve dependencies, define installation payloads, or own runtime and adapter
 policy. The normative boundary is defined by the
 [IR interface guidelines](IR_INTERFACE_GUIDELINES.md).
 
+`Scalar`, `TCRef`, `OpRef`, and `OpDef` are ordinary enums. Match their
+variants directly. Clone, comparison, hashing, formatting, and destruction
+follow ordinary recursive ownership; codecs retain streaming traversal.
+
+Decoding accepts at most 64 structural levels, counting nested containers,
+references, and operations across decoder delegation, including embedded Values.
+Wire envelopes and sibling counts do not consume structural depth. Native
+constructors and runtime composition must respect this contract: codec limits
+do not bound program-generated structures, whose recursive operations can
+otherwise overflow the stack. Invocation and execution budgets belong to the runtime.
+
+Converting Scalar into Value still checks combined tuple depth before construction.
+
 ## Development
 
 ```bash

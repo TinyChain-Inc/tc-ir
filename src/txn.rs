@@ -39,6 +39,9 @@ pub struct TxnId {
     trace: [u8; 32],
 }
 
+impl get_size::GetSize for NetworkTime {}
+impl get_size::GetSize for TxnId {}
+
 impl TxnId {
     /// Construct a new TxnId from raw parts (timestamp in nanos + nonce).
     pub const fn from_parts(timestamp: NetworkTime, nonce: u16) -> Self {

@@ -1,10 +1,9 @@
 use std::collections::BTreeSet;
-use std::str::FromStr;
 
-use crate::{Id, Map, Method, Scalar, Subject};
 use async_hash::{Digest, Hash, Output};
-use destream::{de, en, EncodeMap};
 use pathlink::PathBuf;
+
+use crate::{Id, Map, Scalar, Subject};
 use tc_error::{TCError, TCResult};
 
 /// The data defining a reference to a GET op.
@@ -21,10 +20,9 @@ pub type DeleteRef = (Subject, Scalar);
 
 /// A reference to an op.
 ///
-/// This is a structural port of the v1 `OpRef` enum. Resolution/execution is implemented by the
-/// host kernel and is intentionally not part of this type definition.
+/// Resolution and execution belong to the host kernel.
 ///
-/// ## v1-compatible JSON semantics
+/// ## Wire representation
 ///
 /// Encoded as a single-entry map:
 ///
@@ -68,7 +66,7 @@ impl OpDefType {
         }
     }
 
-    fn path(&self) -> PathBuf {
+    pub(crate) fn path(&self) -> PathBuf {
         match self {
             Self::Get => PathBuf::from(crate::OPDEF_GET),
             Self::Put => PathBuf::from(crate::OPDEF_PUT),
@@ -89,6 +87,34 @@ pub enum OpDef {
     Put(PutOp),
     Post(PostOp),
     Delete(DeleteOp),
+}
+
+impl get_size::GetSize for OpRef {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Get((subject, key)) | Self::Delete((subject, key)) => {
+                subject.get_heap_size() + key.get_heap_size()
+            }
+            Self::Put((subject, key, value)) => {
+                subject.get_heap_size() + key.get_heap_size() + value.get_heap_size()
+            }
+            Self::Post((subject, params)) => subject.get_heap_size() + params.get_heap_size(),
+        }
+    }
+}
+
+impl get_size::GetSize for OpDef {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Get((key, form)) | Self::Delete((key, form)) => {
+                key.get_heap_size() + form.get_heap_size()
+            }
+            Self::Put((key, value, form)) => {
+                key.get_heap_size() + value.get_heap_size() + form.get_heap_size()
+            }
+            Self::Post(form) => form.get_heap_size(),
+        }
+    }
 }
 
 impl OpDef {
@@ -138,7 +164,7 @@ impl OpDef {
         self.form().last().map(|(id, _)| id)
     }
 
-    fn class(&self) -> OpDefType {
+    pub(crate) fn class(&self) -> OpDefType {
         match self {
             Self::Get(_) => OpDefType::Get,
             Self::Put(_) => OpDefType::Put,
@@ -189,36 +215,6 @@ impl OpRef {
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
         crate::scalar::collect_op_ref_requires(self, required)
     }
-
-    pub(crate) fn visit_referenced_methods(
-        &self,
-        visitor: &mut impl FnMut(&pathlink::Link, Method),
-    ) {
-        let (method, subject) = match self {
-            Self::Get((subject, key)) => {
-                key.visit_referenced_methods(visitor);
-                (Method::Get, subject)
-            }
-            Self::Put((subject, key, value)) => {
-                key.visit_referenced_methods(visitor);
-                value.visit_referenced_methods(visitor);
-                (Method::Put, subject)
-            }
-            Self::Post((subject, params)) => {
-                for scalar in params.values() {
-                    scalar.visit_referenced_methods(visitor);
-                }
-                (Method::Post, subject)
-            }
-            Self::Delete((subject, key)) => {
-                key.visit_referenced_methods(visitor);
-                (Method::Delete, subject)
-            }
-        };
-        if let Subject::Link(link) = subject {
-            visitor(link, method);
-        }
-    }
 }
 
 impl<D: Digest> Hash<D> for &OpRef {
@@ -243,306 +239,10 @@ impl<D: Digest> Hash<D> for &OpDef {
     }
 }
 
-impl de::FromStream for OpDef {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct OpDefVisitor;
-
-        impl de::Visitor for OpDefVisitor {
-            type Value = OpDef;
-
-            fn expecting() -> &'static str {
-                "an Op definition"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let key = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("expected Op definition type"))?;
-                let path =
-                    PathBuf::from_str(&key).map_err(|err| de::Error::custom(err.to_string()))?;
-                let op_def_type = OpDefType::from_path(&path).ok_or_else(|| {
-                    de::Error::custom("expected Op definition type, e.g. \"/state/scalar/op/get\"")
-                })?;
-
-                decode_opdef_map_entry(op_def_type, &mut map).await
-            }
-        }
-
-        decoder.decode_map(OpDefVisitor).await
-    }
-}
-
-impl<'en> en::IntoStream<'en> for OpDef {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeMap;
-
-        let mut map = encoder.encode_map(Some(1))?;
-        let class = self.class().path().to_string();
-        match self {
-            Self::Get(def) => map.encode_entry(class, def)?,
-            Self::Put(def) => map.encode_entry(class, def)?,
-            Self::Post(def) => map.encode_entry(class, def)?,
-            Self::Delete(def) => map.encode_entry(class, def)?,
-        }
-        map.end()
-    }
-}
-
-impl<'en> en::ToStream<'en> for OpDef {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeMap;
-
-        let mut map = encoder.encode_map(Some(1))?;
-        let class = self.class().path().to_string();
-        match self {
-            Self::Get(def) => map.encode_entry(class, def)?,
-            Self::Put(def) => map.encode_entry(class, def)?,
-            Self::Post(def) => map.encode_entry(class, def)?,
-            Self::Delete(def) => map.encode_entry(class, def)?,
-        }
-        map.end()
-    }
-}
-
-impl de::FromStream for OpRef {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct OpRefVisitor;
-
-        impl de::Visitor for OpRefVisitor {
-            type Value = OpRef;
-
-            fn expecting() -> &'static str {
-                "an OpRef map"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let key = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("expected OpRef, found empty map"))?;
-
-                decode_opref_map_entry(key, &mut map).await
-            }
-        }
-
-        decoder.decode_map(OpRefVisitor).await
-    }
-}
-
-impl<'en> en::IntoStream<'en> for OpRef {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let mut map = encoder.encode_map(Some(1))?;
-        match self {
-            Self::Get((subject, key)) => map.encode_entry(subject.to_string(), (key,))?,
-            Self::Put((subject, key, value)) => {
-                map.encode_entry(subject.to_string(), (key, value))?
-            }
-            Self::Post((subject, params)) => map.encode_entry(subject.to_string(), params)?,
-            Self::Delete((subject, key)) => map.encode_entry(
-                PathBuf::from(crate::OPREF_DELETE).to_string(),
-                (subject, key),
-            )?,
-        }
-        map.end()
-    }
-}
-
-impl<'en> en::ToStream<'en> for OpRef {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        let mut map = encoder.encode_map(Some(1))?;
-        match self {
-            Self::Get((subject, key)) => map.encode_entry(subject.to_string(), (key,))?,
-            Self::Put((subject, key, value)) => {
-                map.encode_entry(subject.to_string(), (key, value))?
-            }
-            Self::Post((subject, params)) => map.encode_entry(subject.to_string(), params)?,
-            Self::Delete((subject, key)) => map.encode_entry(
-                PathBuf::from(crate::OPREF_DELETE).to_string(),
-                (subject, key),
-            )?,
-        }
-        map.end()
-    }
-}
-
-/// Internal helper used to decode `OpRef` and `TCRef` argument shapes.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum OpArgs {
-    Map(Map<Scalar>),
-    Seq(Vec<Scalar>),
-}
-
-impl de::FromStream for OpArgs {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct ArgsVisitor;
-
-        impl de::Visitor for ArgsVisitor {
-            type Value = OpArgs;
-
-            fn expecting() -> &'static str {
-                "OpRef args (a sequence or map)"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut params = Map::<Scalar>::new();
-                while let Some(key) = map.next_key::<Id>(()).await? {
-                    let value = map.next_value::<Scalar>(()).await?;
-                    params.insert(key, value);
-                }
-                Ok(OpArgs::Map(params))
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut access: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut items = if let Some(len) = access.size_hint() {
-                    Vec::with_capacity(len)
-                } else {
-                    Vec::new()
-                };
-
-                while let Some(item) = access.next_element::<Scalar>(()).await? {
-                    items.push(item);
-                }
-
-                Ok(OpArgs::Seq(items))
-            }
-        }
-
-        decoder.decode_any(ArgsVisitor).await
-    }
-}
-
-pub(crate) async fn decode_opdef_map_entry<A: de::MapAccess>(
-    op_def_type: OpDefType,
-    map: &mut A,
-) -> Result<OpDef, A::Error> {
-    let op = match op_def_type {
-        OpDefType::Get => OpDef::Get(map.next_value::<GetOp>(()).await?),
-        OpDefType::Put => OpDef::Put(map.next_value::<PutOp>(()).await?),
-        OpDefType::Post => OpDef::Post(map.next_value::<PostOp>(()).await?),
-        OpDefType::Delete => OpDef::Delete(map.next_value::<DeleteOp>(()).await?),
-    };
-
-    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-        let _ = map.next_value::<de::IgnoredAny>(()).await?;
-    }
-
-    op.validate()
-        .map_err(|err| de::Error::custom(err.to_string()))?;
-
-    Ok(op)
-}
-
-pub(crate) fn opref_from_subject_args<E: de::Error>(
-    subject: Subject,
-    args: OpArgs,
-) -> Result<OpRef, E> {
-    match args {
-        OpArgs::Map(params) => Ok(OpRef::Post((subject, params))),
-        OpArgs::Seq(items) => match items.as_slice() {
-            [key] => Ok(OpRef::Get((subject, key.clone()))),
-            [key, value] => Ok(OpRef::Put((subject, key.clone(), value.clone()))),
-            _ => Err(de::Error::custom(
-                "invalid OpRef params (expected 1 or 2 elements)",
-            )),
-        },
-    }
-}
-
-pub(crate) async fn decode_opref_map_entry<A: de::MapAccess>(
-    key: String,
-    map: &mut A,
-) -> Result<OpRef, A::Error> {
-    let op = if key.starts_with('/') {
-        let path = PathBuf::from_str(&key).ok();
-
-        if path.as_ref() == Some(&PathBuf::from(crate::OPREF_GET)) {
-            let get = map.next_value::<(Subject, Scalar)>(()).await?;
-            OpRef::Get(get)
-        } else if path.as_ref() == Some(&PathBuf::from(crate::OPREF_PUT)) {
-            let put = map.next_value::<(Subject, Scalar, Scalar)>(()).await?;
-            OpRef::Put(put)
-        } else if path.as_ref() == Some(&PathBuf::from(crate::OPREF_POST)) {
-            let post = map.next_value::<(Subject, Map<Scalar>)>(()).await?;
-            OpRef::Post(post)
-        } else if path.as_ref() == Some(&PathBuf::from(crate::OPREF_DELETE)) {
-            let delete = map.next_value::<(Subject, Scalar)>(()).await?;
-            OpRef::Delete(delete)
-        } else {
-            let subject = crate::scalar::subject_from_str(&key)
-                .map_err(|err| de::Error::custom(err.to_string()))?;
-
-            let args = map.next_value::<OpArgs>(()).await?;
-            match args {
-                OpArgs::Map(params) => OpRef::Post((subject, params)),
-                OpArgs::Seq(items) => match items.as_slice() {
-                    [key] => OpRef::Get((subject, key.clone())),
-                    [key, value] => OpRef::Put((subject, key.clone(), value.clone())),
-                    _ => {
-                        return Err(de::Error::custom(
-                            "invalid OpRef params (expected 1 or 2 elements)",
-                        ));
-                    }
-                },
-            }
-        }
-    } else {
-        let subject = crate::scalar::subject_from_str(&key)
-            .map_err(|err| de::Error::custom(err.to_string()))?;
-
-        let args = map.next_value::<OpArgs>(()).await?;
-        match args {
-            OpArgs::Map(params) => OpRef::Post((subject, params)),
-            OpArgs::Seq(items) => match items.as_slice() {
-                [key] => OpRef::Get((subject, key.clone())),
-                [key, value] => OpRef::Put((subject, key.clone(), value.clone())),
-                _ => {
-                    return Err(de::Error::custom(
-                        "invalid OpRef params (expected 1 or 2 elements)",
-                    ));
-                }
-            },
-        }
-    };
-
-    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-        let _ = map.next_value::<de::IgnoredAny>(()).await?;
-    }
-
-    Ok(op)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IdRef, TCRef};
+    use crate::{IdRef, Scalar, TCRef};
     use bytes::Bytes;
     use futures::{future, stream};
 

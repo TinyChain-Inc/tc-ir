@@ -18,6 +18,14 @@ belongs downstream.
 ## Algebra
 
 `Scalar`, `TCRef`, `OpRef`, and `OpDef` are the canonical graph vocabulary.
+These types are ordinary enums; match their variants directly. Native ownership,
+cloning, equality, hashing, formatting, and destruction recurse normally.
+Codecs enforce at most 64 structural levels, carrying the remaining allowance
+across nested IR and Value decoding. Wire envelopes and sibling counts do not
+consume structural depth. Trusted native constructors and runtime composition
+must respect this contract; codec validation alone does not bound program-generated
+nesting. Execution and streaming traversal retain their separate stack-safety mechanisms.
+
 Maps and tuples compose these forms recursively. Control flow is expressed by
 ordinary `TCRef` variants; no adapter or application-specific scalar variant is
 permitted.
@@ -137,13 +145,18 @@ route and duplicate delegation.
 ## Hashing and codecs
 
 Owned and borrowed streaming codecs use the same representation. Borrowed codecs
-delegate recursively to their semantic children without cloning the expression
-tree; fixed argument sequences use native tuples.
+traverse their semantic children without cloning the expression tree. Fixed
+argument sequences retain their explicit field order and cardinality.
 
 The algebra implements `async_hash::Hash` directly. Maps use deterministic key
 order and sequences preserve their semantic order. These are structural hashes
 of decoded forms, not application digest policy. Hashing must not depend on JSON
 whitespace or transport encoding.
+
+IR decoding retains explicit semantic continuation frames over the decoder’s
+shallow containers. Encoding produces an owned or borrowing event stream. Codec
+framing and leaf parsing remain with `destream`; neither operation constructs a
+second raw syntax tree or chains one recursive future per nested IR value.
 
 Every `FromStream` implementation accepts the form emitted by its `IntoStream`
 implementation. Encoding must not implement equality, hashing, cloning,

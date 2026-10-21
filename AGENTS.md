@@ -15,3 +15,9 @@ normative contract. Do not duplicate or broaden that contract here.
 - Add symmetric codec tests for representation changes and deterministic golden
   tests for structural-hash changes.
 - Run `cargo test --all-targets --all-features` before submitting a change.
+
+- Match Value, Scalar, TCRef, State, and StateView variants directly. Codecs
+  enforce 64 structural levels; trusted native composition must respect that
+  bound. Conversions into Value check its 64-tuple limit, including embedded
+  Values, before construction. Keep execution stack safety separate from data
+  ownership.
