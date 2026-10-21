@@ -31,7 +31,10 @@ ordinary `TCRef` variants; no adapter or application-specific scalar variant is
 permitted.
 
 Lexical-requirement discovery and referenced-method visitation are intrinsic
-recursive queries on these owning values. `requires` reports identifiers used
+recursive queries on these owning values. Subject rewriting and lexical validation
+use the same owner-local delegation, borrowing scopes and cloning only when
+introducing bindings. These synchronous inspections rely on the structural
+nesting contract, not an arbitrary-depth traversal guarantee. `requires` reports identifiers used
 but not bound by the inspected form; it neither creates nor mutates a runtime
 namespace and is not an execution plan. The reference visitor reports
 individual Link/verb occurrences without classification or aggregation; they

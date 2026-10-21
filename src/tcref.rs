@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 
 use async_hash::{Digest, Hash, Output};
 
-use crate::{Id, IdRef, Scalar};
+use crate::{Id, IdRef, Scalar, Subject};
+use tc_error::TCResult;
 
 /// A reference to a scalar value, with ordinary recursive ownership.
 #[allow(clippy::large_enum_variant)]
@@ -133,7 +134,133 @@ impl get_size::GetSize for TCRef {
 
 impl TCRef {
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
-        crate::scalar::collect_ref_requires(self, required)
+        self.requires_in(&BTreeSet::new(), required)
+    }
+
+    pub(crate) fn requires_in(&self, bound: &BTreeSet<Id>, required: &mut BTreeSet<Id>) {
+        match self {
+            Self::Id(id) => {
+                if id.as_str() != "self" && !bound.contains(id.id()) {
+                    required.insert(id.id().clone());
+                }
+            }
+            Self::Op(op) => op.requires_in(bound, required),
+            Self::Cond(value) => {
+                value.cond.requires_in(bound, required);
+                value.then.requires_in(bound, required);
+                value.or_else.requires_in(bound, required);
+            }
+            Self::After(value) => {
+                value.when.requires_in(bound, required);
+                value.then.requires_in(bound, required);
+            }
+            Self::While(value) => {
+                let mut callback = bound.clone();
+                callback.insert("state".parse().expect("reserved callback Id"));
+                value.cond.requires_in(&callback, required);
+                value.closure.requires_in(&callback, required);
+                value.state.requires_in(bound, required);
+            }
+            Self::ForEach(value) => {
+                let mut body = bound.clone();
+                body.insert(value.item_name.clone());
+                value.op.requires_in(&body, required);
+                value.items.requires_in(bound, required);
+            }
+        }
+    }
+
+    pub(crate) fn validate_in(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
+        match self {
+            Self::Id(_) => {}
+            Self::Op(op) => op.validate_in(visible)?,
+            Self::Cond(value) => {
+                value.cond.validate_in(visible)?;
+                value.then.validate_in(visible)?;
+                value.or_else.validate_in(visible)?;
+            }
+            Self::After(value) => {
+                value.when.validate_in(visible)?;
+                value.then.validate_in(visible)?;
+            }
+            Self::While(value) => {
+                let mut callback = visible.clone();
+                crate::op::bind(
+                    &mut callback,
+                    &mut BTreeSet::new(),
+                    &"state".parse().expect("reserved callback Id"),
+                    "While callback parameter",
+                )?;
+                value.cond.validate_in(&callback)?;
+                value.closure.validate_in(&callback)?;
+                value.state.validate_in(visible)?;
+            }
+            Self::ForEach(value) => {
+                let mut body = visible.clone();
+                crate::op::bind(
+                    &mut body,
+                    &mut BTreeSet::new(),
+                    &value.item_name,
+                    "ForEach item",
+                )?;
+                value.op.validate_in(&body)?;
+                value.items.validate_in(visible)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn map_subjects(&mut self, visitor: &mut impl FnMut(&mut Subject)) {
+        match self {
+            Self::Id(_) => {}
+            Self::Op(op) => op.map_subjects(visitor),
+            Self::Cond(value) => {
+                value.or_else.map_subjects(visitor);
+                value.then.map_subjects(visitor);
+                value.cond.map_subjects(visitor);
+            }
+            Self::After(value) => {
+                value.then.map_subjects(visitor);
+                value.when.map_subjects(visitor);
+            }
+            Self::While(value) => {
+                value.state.map_subjects(visitor);
+                value.closure.map_subjects(visitor);
+                value.cond.map_subjects(visitor);
+            }
+            Self::ForEach(value) => {
+                value.op.map_subjects(visitor);
+                value.items.map_subjects(visitor);
+            }
+        }
+    }
+
+    pub(crate) fn visit_referenced_methods(
+        &self,
+        visitor: &mut impl FnMut(&pathlink::Link, crate::Method),
+    ) {
+        match self {
+            Self::Id(_) => {}
+            Self::Op(op) => op.visit_referenced_methods(visitor),
+            Self::Cond(value) => {
+                value.cond.visit_referenced_methods(visitor);
+                value.then.visit_referenced_methods(visitor);
+                value.or_else.visit_referenced_methods(visitor);
+            }
+            Self::After(value) => {
+                value.when.visit_referenced_methods(visitor);
+                value.then.visit_referenced_methods(visitor);
+            }
+            Self::While(value) => {
+                value.cond.visit_referenced_methods(visitor);
+                value.closure.visit_referenced_methods(visitor);
+                value.state.visit_referenced_methods(visitor);
+            }
+            Self::ForEach(value) => {
+                value.items.visit_referenced_methods(visitor);
+                value.op.visit_referenced_methods(visitor);
+            }
+        }
     }
 }
 

@@ -148,3 +148,83 @@ async fn shared_lexical_fixtures_enforce_the_contract() {
         decoded.expect_err("invalid lexical fixture");
     }
 }
+
+#[test]
+fn recursive_visitors_preserve_order_and_scope() {
+    let link = pathlink::Link::from(pathlink::PathBuf::from(pathlink::path_label(&["test"])));
+    let call = |name: &str| {
+        Scalar::from(TCRef::Op(OpRef::Get((
+            Subject::Link(link.clone().append(id(name))),
+            Scalar::default(),
+        ))))
+    };
+    let value = Scalar::from(TCRef::Op(OpRef::Put((
+        Subject::Link(link.clone()),
+        call("key"),
+        call("value"),
+    ))));
+    let mut methods = Vec::new();
+    value.visit_referenced_methods(&mut |link, method| methods.push((link.clone(), method)));
+    assert_eq!(
+        methods,
+        vec![
+            (link.clone().append(id("key")), crate::Method::Get),
+            (link.clone().append(id("value")), crate::Method::Get),
+            (link.clone(), crate::Method::Put),
+        ]
+    );
+
+    let mut op = OpDef::Post(vec![(id("first"), value), (id("last"), call("last"))]);
+    let mut subjects = Vec::new();
+    op.map_subjects(&mut |subject| subjects.push(subject.clone()));
+    assert_eq!(
+        subjects,
+        vec![
+            Subject::Link(link.clone().append(id("last"))),
+            Subject::Link(link.clone()),
+            Subject::Link(link.clone().append(id("value"))),
+            Subject::Link(link.append(id("key"))),
+        ]
+    );
+    assert!(!Scalar::Op(op.clone()).is_ref());
+    assert!(Scalar::Tuple(vec![Scalar::Op(op), reference("$input")]).is_ref());
+
+    let each = Scalar::from(TCRef::ForEach(Box::new(crate::ForEach::new(
+        reference("$item"),
+        reference("$item"),
+        id("item"),
+    ))));
+    let while_ref = Scalar::from(TCRef::While(Box::new(crate::While::new(
+        reference("$state"),
+        reference("$state"),
+        reference("$state"),
+    ))));
+    let mut required = BTreeSet::new();
+    Scalar::Tuple(vec![each, while_ref, reference("$self")]).requires(&mut required);
+    assert_eq!(required, BTreeSet::from([id("item"), id("state")]));
+
+    // Body validation precedes items; binding errors precede either child.
+    let invalid = |name: &str| {
+        Scalar::Op(OpDef::Post(vec![
+            (id(name), Scalar::default()),
+            (id(name), Scalar::default()),
+        ]))
+    };
+    let each = Scalar::from(TCRef::ForEach(Box::new(crate::ForEach::new(
+        invalid("items"),
+        invalid("body"),
+        id("item"),
+    ))));
+    let op = OpDef::Post(vec![(id("result"), each.clone())]);
+    assert!(op
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate OpDef binding $body"));
+    let op = OpDef::Post(vec![(id("item"), each)]);
+    assert!(op
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("shadowed OpDef binding $item"));
+}

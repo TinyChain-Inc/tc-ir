@@ -119,6 +119,84 @@ async fn canonical_depth_and_lifecycle_use_the_worker_stack() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recursive_queries_use_the_worker_stack() {
+    tokio::spawn(async {
+        use crate::{Id, IdRef, OpDef, OpRef, Subject, TCRef};
+        use std::collections::BTreeSet;
+
+        let resource =
+            pathlink::Link::from(pathlink::PathBuf::from(pathlink::path_label(&["test"])));
+        for form in 0..7 {
+            let mut value = Scalar::from(TCRef::Op(OpRef::Get((
+                Subject::Link(resource.clone()),
+                Scalar::from(TCRef::Id(IdRef::new("input".parse().unwrap()))),
+            ))));
+            for level in 0..MAX_SCALAR_DEPTH {
+                let name: Id = format!("level{level}").parse().unwrap();
+                value = match form {
+                    0 => Scalar::Tuple(vec![value]),
+                    1 => Scalar::Map([(name, value)].into_iter().collect()),
+                    2 => Scalar::Op(OpDef::Post(vec![(name, value)])),
+                    3 => Scalar::from(TCRef::After(Box::new(crate::After::new(
+                        Scalar::default(),
+                        value,
+                    )))),
+                    4 => Scalar::from(TCRef::Cond(Box::new(crate::Cond::new(
+                        TCRef::Id(IdRef::new("condition".parse().unwrap())),
+                        value,
+                        Scalar::default(),
+                    )))),
+                    // Nest outside the callback scope so binders do not shadow.
+                    5 => Scalar::from(TCRef::While(Box::new(crate::While::new(
+                        Scalar::default(),
+                        Scalar::default(),
+                        value,
+                    )))),
+                    _ => Scalar::from(TCRef::ForEach(Box::new(crate::ForEach::new(
+                        value,
+                        Scalar::default(),
+                        name,
+                    )))),
+                };
+            }
+            let mut required = BTreeSet::new();
+            value.requires(&mut required);
+            assert!(required.contains(&"input".parse::<Id>().unwrap()));
+            assert_eq!(value.is_ref(), form != 2);
+            let mut calls = 0;
+            value.visit_referenced_methods(&mut |link, method| {
+                assert_eq!(link, &resource);
+                assert_eq!(method, crate::Method::Get);
+                calls += 1;
+            });
+            assert_eq!(calls, 1);
+            let op = OpDef::Post(vec![("result".parse().unwrap(), value)]);
+            op.validate().unwrap();
+            assert_eq!(
+                op.clone()
+                    .reference_self(&resource)
+                    .dereference_self(&resource),
+                op
+            );
+        }
+
+        let values = (0..4097)
+            .map(|_| Scalar::from(TCRef::Id(IdRef::new("input".parse().unwrap()))))
+            .collect();
+        let value = Scalar::Tuple(values);
+        let mut required = BTreeSet::new();
+        value.requires(&mut required);
+        assert_eq!(required, BTreeSet::from(["input".parse().unwrap()]));
+        assert!(value.is_ref());
+        OpDef::Post(vec![("result".parse().unwrap(), value)])
+            .validate()
+            .unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_and_cancelled_deep_inputs_release_owned_state() {
     tokio::spawn(async {
         for binary in [false, true] {

@@ -121,7 +121,7 @@ impl OpDef {
     /// Bind concrete references beneath this resource to its native `$self`.
     /// Replicated methods use this so their local writes are not forwarded again.
     pub fn reference_self(mut self, resource: &pathlink::Link) -> Self {
-        crate::scalar::map_subjects(&mut self, &mut |subject| {
+        self.map_subjects(&mut |subject| {
             if let Subject::Link(link) = subject {
                 if link.host() == resource.host() && link.path().starts_with(resource.path()) {
                     *subject = Subject::Ref(
@@ -137,7 +137,7 @@ impl OpDef {
     /// Bind `$self` operations to the owning resource's public invocation boundary.
     /// Composed methods use this so nested writes participate in replication.
     pub fn dereference_self(mut self, resource: &pathlink::Link) -> Self {
-        crate::scalar::map_subjects(&mut self, &mut |subject| {
+        self.map_subjects(&mut |subject| {
             if let Subject::Ref(id, suffix) = subject {
                 if id.as_str() == "self" {
                     let mut link = resource.clone();
@@ -174,12 +174,77 @@ impl OpDef {
     }
 
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
-        crate::scalar::collect_op_requires(self, required)
+        self.requires_in(&BTreeSet::new(), required)
     }
 
     /// Validate that this operation is a single-assignment lexical scope.
     pub fn validate(&self) -> TCResult<()> {
-        crate::scalar::validate_op(self, &BTreeSet::new())
+        self.validate_in(&BTreeSet::new())
+    }
+
+    pub(crate) fn requires_in(&self, bound: &BTreeSet<Id>, required: &mut BTreeSet<Id>) {
+        let mut local = bound.clone();
+        match self {
+            Self::Get((key, _)) | Self::Delete((key, _)) => {
+                local.insert(key.clone());
+            }
+            Self::Put((key, value, _)) => {
+                local.insert(key.clone());
+                local.insert(value.clone());
+            }
+            Self::Post(_) => {}
+        }
+        local.extend(self.form().iter().map(|(id, _)| id.clone()));
+        for (_, value) in self.form() {
+            value.requires_in(&local, required);
+        }
+    }
+
+    pub(crate) fn validate_in(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
+        if self.form().is_empty() {
+            return Err(TCError::bad_request(
+                "an OpDef must define at least one provider",
+            ));
+        }
+
+        let mut scope = visible.clone();
+        let mut local = BTreeSet::new();
+        match self {
+            Self::Get((key, _)) | Self::Delete((key, _)) => {
+                bind(&mut scope, &mut local, key, "parameter")?;
+            }
+            Self::Put((key, value, _)) => {
+                bind(&mut scope, &mut local, key, "parameter")?;
+                bind(&mut scope, &mut local, value, "parameter")?;
+            }
+            Self::Post(_) => {}
+        }
+        for (id, _) in self.form() {
+            bind(&mut scope, &mut local, id, "provider")?;
+        }
+        for (_, value) in self.form() {
+            value.validate_in(&scope)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn map_subjects(&mut self, visitor: &mut impl FnMut(&mut Subject)) {
+        let form = match self {
+            Self::Get((_, form)) | Self::Delete((_, form)) => form,
+            Self::Put((_, _, form)) | Self::Post(form) => form,
+        };
+        for (_, value) in form.iter_mut().rev() {
+            value.map_subjects(visitor);
+        }
+    }
+
+    pub(crate) fn visit_referenced_methods(
+        &self,
+        visitor: &mut impl FnMut(&pathlink::Link, crate::Method),
+    ) {
+        for (_, value) in self.form() {
+            value.visit_referenced_methods(visitor);
+        }
     }
 }
 
@@ -213,7 +278,100 @@ pub(crate) fn bind(
 
 impl OpRef {
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
-        crate::scalar::collect_op_ref_requires(self, required)
+        self.requires_in(&BTreeSet::new(), required)
+    }
+
+    pub(crate) fn requires_in(&self, bound: &BTreeSet<Id>, required: &mut BTreeSet<Id>) {
+        let subject = match self {
+            Self::Get((subject, key)) | Self::Delete((subject, key)) => {
+                key.requires_in(bound, required);
+                subject
+            }
+            Self::Put((subject, key, value)) => {
+                key.requires_in(bound, required);
+                value.requires_in(bound, required);
+                subject
+            }
+            Self::Post((subject, params)) => {
+                for value in params.values() {
+                    value.requires_in(bound, required);
+                }
+                subject
+            }
+        };
+        if let Subject::Ref(id, _) = subject {
+            if id.as_str() != "self" && !bound.contains(id.id()) {
+                required.insert(id.id().clone());
+            }
+        }
+    }
+
+    pub(crate) fn validate_in(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
+        match self {
+            Self::Get((_, key)) | Self::Delete((_, key)) => key.validate_in(visible)?,
+            Self::Put((_, key, value)) => {
+                key.validate_in(visible)?;
+                value.validate_in(visible)?;
+            }
+            Self::Post((_, params)) => {
+                for value in params.values() {
+                    value.validate_in(visible)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn map_subjects(&mut self, visitor: &mut impl FnMut(&mut Subject)) {
+        // Preserve subject-first rewriting and reverse argument visitation.
+        match self {
+            Self::Get((subject, key)) | Self::Delete((subject, key)) => {
+                visitor(subject);
+                key.map_subjects(visitor);
+            }
+            Self::Put((subject, key, value)) => {
+                visitor(subject);
+                value.map_subjects(visitor);
+                key.map_subjects(visitor);
+            }
+            Self::Post((subject, params)) => {
+                visitor(subject);
+                for value in params.values_mut().rev() {
+                    value.map_subjects(visitor);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn visit_referenced_methods(
+        &self,
+        visitor: &mut impl FnMut(&pathlink::Link, crate::Method),
+    ) {
+        // Report the enclosing call after its arguments, in source order.
+        let (subject, method) = match self {
+            Self::Get((subject, key)) => {
+                key.visit_referenced_methods(visitor);
+                (subject, crate::Method::Get)
+            }
+            Self::Delete((subject, key)) => {
+                key.visit_referenced_methods(visitor);
+                (subject, crate::Method::Delete)
+            }
+            Self::Put((subject, key, value)) => {
+                key.visit_referenced_methods(visitor);
+                value.visit_referenced_methods(visitor);
+                (subject, crate::Method::Put)
+            }
+            Self::Post((subject, params)) => {
+                for value in params.values() {
+                    value.visit_referenced_methods(visitor);
+                }
+                (subject, crate::Method::Post)
+            }
+        };
+        if let Subject::Link(link) = subject {
+            visitor(link, method);
+        }
     }
 }
 
