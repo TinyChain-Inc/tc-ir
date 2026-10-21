@@ -207,7 +207,7 @@ pub async fn decode_scalar<D: de::Decoder>(
             let remaining = descend::<D::Error>(remaining, 1)?;
             let sequence = decoder.open_container(de::Kind::Seq, None).await?;
             Ok(Scalar::Tuple(
-                Box::pin(scalar_items(decoder, sequence, remaining)).await?,
+                scalar_items(decoder, sequence, remaining).await?,
             ))
         }
         de::Kind::Map => {
@@ -223,41 +223,55 @@ pub async fn decode_scalar<D: de::Decoder>(
                     Box::pin(scalar_map(decoder, map, Some(key), remaining, true)).await?,
                 ));
             }
-            if let Some(value) = Box::pin(tc_value::decode_typed_value(
-                &key, decoder, &mut map, remaining,
-            ))
-            .await?
-            {
-                finish_map(decoder, map, true).await?;
-                return Ok(value.into());
-            }
-            let path = PathBuf::from_str(&key).ok();
-            let value = if let Some(kind) = path.as_ref().and_then(OpDefType::from_path) {
-                let remaining = descend::<D::Error>(remaining, 2)?;
-                Scalar::Op(Box::pin(op_payload(decoder, kind, remaining)).await?)
-            } else if path.as_deref().is_some_and(reference_path) {
-                let remaining = descend::<D::Error>(remaining, 1)?;
-                Box::pin(reference_payload(decoder, &key, remaining))
-                    .await?
-                    .into()
-            } else {
-                match Box::pin(args(decoder, remaining, 3)).await? {
-                    Scalar::Tuple(items) if items.is_empty() => {
-                        if key.starts_with('$') {
-                            descend::<D::Error>(remaining, 1)?;
-                            TCRef::Id(key.parse().map_err(de::Error::custom)?).into()
-                        } else {
-                            Value::from(Link::from_str(&key).map_err(de::Error::custom)?).into()
-                        }
-                    }
-                    args => TCRef::Op(call::<D::Error>(&key, args)?).into(),
-                }
-            };
-            decoder.finish_child(&mut map).await?;
-            finish_map(decoder, map, !key.starts_with('$')).await?;
-            Ok(value)
+
+            Box::pin(tagged_scalar(decoder, map, key, remaining)).await
         }
     }
+}
+
+// Keep tagged payload construction out of every ordinary container's polling
+// frame. Boxing recursive futures alone does not bound their polling stack.
+async fn tagged_scalar<D: de::Decoder>(
+    decoder: &mut D,
+    mut map: de::Container,
+    key: String,
+    remaining: usize,
+) -> Result<Scalar, D::Error> {
+    if let Some(value) = Box::pin(tc_value::decode_typed_value(
+        &key, decoder, &mut map, remaining,
+    ))
+    .await?
+    {
+        finish_map(decoder, map, true).await?;
+        return Ok(value.into());
+    }
+
+    let path = PathBuf::from_str(&key).ok();
+    let value = if let Some(kind) = path.as_ref().and_then(OpDefType::from_path) {
+        let remaining = descend::<D::Error>(remaining, 2)?;
+        Scalar::Op(Box::pin(op_payload(decoder, kind, remaining)).await?)
+    } else if path.as_deref().is_some_and(reference_path) {
+        let remaining = descend::<D::Error>(remaining, 1)?;
+        Box::pin(reference_payload(decoder, &key, remaining))
+            .await?
+            .into()
+    } else {
+        match Box::pin(args(decoder, remaining, 3)).await? {
+            Scalar::Tuple(items) if items.is_empty() => {
+                if key.starts_with('$') {
+                    descend::<D::Error>(remaining, 1)?;
+                    TCRef::Id(key.parse().map_err(de::Error::custom)?).into()
+                } else {
+                    Value::from(Link::from_str(&key).map_err(de::Error::custom)?).into()
+                }
+            }
+            args => TCRef::Op(call::<D::Error>(&key, args)?).into(),
+        }
+    };
+
+    decoder.finish_child(&mut map).await?;
+    finish_map(decoder, map, !key.starts_with('$')).await?;
+    Ok(value)
 }
 
 async fn reference<D: de::Decoder>(decoder: &mut D, remaining: usize) -> Result<TCRef, D::Error> {

@@ -25,6 +25,33 @@ async fn decode(binary: bool, input: Vec<u8>) -> Result<Scalar, String> {
     }
 }
 
+async fn encode_boundary(value: &Scalar, binary: bool, owned: bool) -> Vec<u8> {
+    let mut encoded = match (binary, owned) {
+        (false, false) => destream_json::encode(value)
+            .unwrap()
+            .map_err(|error| error.to_string())
+            .boxed(),
+        (false, true) => destream_json::encode(value.clone())
+            .unwrap()
+            .map_err(|error| error.to_string())
+            .boxed(),
+        (true, false) => tbon::en::encode(value)
+            .unwrap()
+            .map_err(|error| error.to_string())
+            .boxed(),
+        (true, true) => tbon::en::encode(value.clone())
+            .unwrap()
+            .map_err(|error| error.to_string())
+            .boxed(),
+    };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = encoded.try_next().await.unwrap() {
+        bytes.extend_from_slice(&chunk);
+    }
+    drop(encoded);
+    bytes
+}
+
 fn wire(binary: bool, map: bool, depth: usize) -> Vec<u8> {
     let prefix = if map {
         if binary {
@@ -75,13 +102,12 @@ async fn canonical_depth_and_lifecycle_use_the_worker_stack() {
                     assert_eq!(Hash::<Sha256>::hash(&value), Hash::<Sha256>::hash(&cloned));
                     assert!(value.get_heap_size() > 0);
                     assert!(!format!("{value:?}").is_empty());
-                    let mut encoded = destream_json::encode(&value).unwrap();
-                    let mut bytes = Vec::new();
-                    while let Some(chunk) = encoded.try_next().await.unwrap() {
-                        bytes.extend_from_slice(&chunk);
+                    for binary in [false, true] {
+                        for owned in [false, true] {
+                            let bytes = Box::pin(encode_boundary(&value, binary, owned)).await;
+                            assert_eq!(decode(binary, bytes).await.unwrap(), value);
+                        }
                     }
-                    drop(encoded);
-                    assert_eq!(decode(false, bytes).await.unwrap(), value);
                     drop(cloned);
                     drop(value);
                 }
