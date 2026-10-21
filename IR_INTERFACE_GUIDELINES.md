@@ -20,7 +20,7 @@ belongs downstream.
 `Scalar`, `TCRef`, `OpRef`, and `OpDef` are the canonical graph vocabulary.
 These types are ordinary enums; match their variants directly. Native ownership,
 cloning, equality, hashing, formatting, and destruction recurse normally.
-Codecs enforce at most 64 structural levels, carrying the remaining allowance
+Codecs enforce at most 16 structural levels, carrying the remaining allowance
 across nested IR and Value decoding. Wire envelopes and sibling counts do not
 consume structural depth. Trusted native constructors and runtime composition
 must respect this contract; codec validation alone does not bound program-generated
@@ -153,10 +153,12 @@ order and sequences preserve their semantic order. These are structural hashes
 of decoded forms, not application digest policy. Hashing must not depend on JSON
 whitespace or transport encoding.
 
-IR decoding retains explicit semantic continuation frames over the decoder’s
-shallow containers. Encoding produces an owned or borrowing event stream. Codec
-framing and leaf parsing remain with `destream`; neither operation constructs a
-second raw syntax tree or chains one recursive future per nested IR value.
+IR decoding delegates to concrete typed functions over shallow containers. A
+remaining-depth allowance bounds recursive polling before entering each native
+structure; siblings and wire envelopes do not consume it. Recursive future edges
+are boxed for finite future sizes, not as a substitute for the depth limit.
+Encoding retains its owned or borrowing event stream; framing and leaf parsing
+remain with `destream`.
 
 Every `FromStream` implementation accepts the form emitted by its `IntoStream`
 implementation. Encoding must not implement equality, hashing, cloning,

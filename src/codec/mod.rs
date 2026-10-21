@@ -1,4 +1,4 @@
-//! IR codecs own semantic continuations; destream codecs own framing and leaf parsing.
+//! IR codecs own typed structure; destream codecs own framing and leaf parsing.
 mod decode;
 mod encode;
 

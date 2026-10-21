@@ -54,6 +54,7 @@ impl<'a> Events<'a> {
         let mut pending = Vec::new();
         pending.try_reserve(1).map_err(E::custom)?;
         pending.push(root);
+
         Ok(Self { pending })
     }
 
@@ -66,16 +67,10 @@ impl<'a> Events<'a> {
         self.pending.push(Node::Leaf(Leaf::Text(value.to_string())));
     }
 
-    fn scalar_fields(&mut self, values: impl DoubleEndedIterator<Item = Scalar>, len: usize) {
+    fn fields<const N: usize>(&mut self, values: [Node<'a>; N]) {
         self.pending.push(Node::End);
-        self.pending.extend(values.rev().map(Node::Scalar));
-        self.pending.push(Node::SeqStart(len));
-    }
-
-    fn borrowed_fields(&mut self, values: impl DoubleEndedIterator<Item = &'a Scalar>, len: usize) {
-        self.pending.push(Node::End);
-        self.pending.extend(values.rev().map(Node::BorrowedScalar));
-        self.pending.push(Node::SeqStart(len));
+        self.pending.extend(values.into_iter().rev());
+        self.pending.push(Node::SeqStart(N));
     }
 
     fn next_event<E: en::Error>(&mut self) -> Result<Option<en::Event<Leaf<'a>>>, E> {
@@ -90,6 +85,7 @@ impl<'a> Events<'a> {
                 _ => 8,
             };
             self.pending.try_reserve(additional).map_err(E::custom)?;
+
             match node {
                 Node::SeqStart(len) => return Ok(Some(en::Event::SeqStart(Some(len)))),
                 Node::MapStart(len) => return Ok(Some(en::Event::MapStart(Some(len)))),
@@ -215,7 +211,7 @@ impl<'a> Events<'a> {
                     TCRef::After(value) => {
                         let crate::After { when, then } = *value;
                         self.pending.push(Node::End);
-                        self.scalar_fields([when, then].into_iter(), 2);
+                        self.fields([when, then].map(Node::Scalar));
                         self.tag(crate::TCREF_AFTER.to_string());
                     }
                     TCRef::While(value) => {
@@ -225,7 +221,7 @@ impl<'a> Events<'a> {
                             state,
                         } = *value;
                         self.pending.push(Node::End);
-                        self.scalar_fields([cond, closure, state].into_iter(), 3);
+                        self.fields([cond, closure, state].map(Node::Scalar));
                         self.tag(crate::TCREF_WHILE.to_string());
                     }
                     TCRef::ForEach(value) => {
@@ -264,14 +260,13 @@ impl<'a> Events<'a> {
                     }
                     TCRef::After(value) => {
                         self.pending.push(Node::End);
-                        self.borrowed_fields([&value.when, &value.then].into_iter(), 2);
+                        self.fields([&value.when, &value.then].map(Node::BorrowedScalar));
                         self.tag(crate::TCREF_AFTER.to_string());
                     }
                     TCRef::While(value) => {
                         self.pending.push(Node::End);
-                        self.borrowed_fields(
-                            [&value.cond, &value.closure, &value.state].into_iter(),
-                            3,
+                        self.fields(
+                            [&value.cond, &value.closure, &value.state].map(Node::BorrowedScalar),
                         );
                         self.tag(crate::TCREF_WHILE.to_string());
                     }
@@ -290,11 +285,11 @@ impl<'a> Events<'a> {
                     self.pending.push(Node::End);
                     match value {
                         OpRef::Get((subject, key)) => {
-                            self.scalar_fields([key].into_iter(), 1);
+                            self.fields([key].map(Node::Scalar));
                             self.tag(subject.to_string());
                         }
                         OpRef::Put((subject, key, value)) => {
-                            self.scalar_fields([key, value].into_iter(), 2);
+                            self.fields([key, value].map(Node::Scalar));
                             self.tag(subject.to_string());
                         }
                         OpRef::Post((subject, params)) => {
@@ -313,11 +308,11 @@ impl<'a> Events<'a> {
                     self.pending.push(Node::End);
                     match value {
                         OpRef::Get((subject, key)) => {
-                            self.borrowed_fields([key].into_iter(), 1);
+                            self.fields([key].map(Node::BorrowedScalar));
                             self.tag(subject.to_string());
                         }
                         OpRef::Put((subject, key, value)) => {
-                            self.borrowed_fields([key, value].into_iter(), 2);
+                            self.fields([key, value].map(Node::BorrowedScalar));
                             self.tag(subject.to_string());
                         }
                         OpRef::Post((subject, params)) => {
@@ -376,7 +371,7 @@ impl<'a> Events<'a> {
 }
 
 macro_rules! encode_root {
-    ($ty:ty,$owned:ident,$borrowed:ident) => {
+    ($ty:ty, $owned:ident, $borrowed:ident) => {
         impl<'en> IntoStream<'en> for $ty {
             fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
                 let mut events = Events::new::<E::Error>(Node::$owned(self))?;
@@ -391,6 +386,7 @@ macro_rules! encode_root {
                 })))
             }
         }
+
         impl<'en> ToStream<'en> for $ty {
             fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
                 let mut events = Events::new::<E::Error>(Node::$borrowed(self))?;
@@ -414,33 +410,5 @@ encode_root!(OpDef, Op, BorrowedOp);
 encode_root!(OpRef, Call, BorrowedCall);
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sibling_count_does_not_expand_event_continuations() {
-        for count in [1, 4097] {
-            let form = || {
-                (0..count)
-                    .map(|n| (format!("item{n}").parse().unwrap(), Scalar::default()))
-                    .collect::<Vec<_>>()
-            };
-            for value in [
-                Scalar::Tuple(vec![Scalar::default(); count]),
-                Scalar::Map(form().into_iter().collect()),
-                Scalar::from(OpDef::Post(form())),
-            ] {
-                for root in [Node::BorrowedScalar(&value), Node::Scalar(value.clone())] {
-                    let mut events = Events::new::<destream_json::en::Error>(root).unwrap();
-                    while events
-                        .next_event::<destream_json::en::Error>()
-                        .unwrap()
-                        .is_some()
-                    {
-                        assert!(events.pending.len() <= 8);
-                    }
-                }
-            }
-        }
-    }
-}
+#[path = "../../tests/unit/codec/encode.rs"]
+mod tests;

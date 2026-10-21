@@ -4,8 +4,13 @@ use async_hash::{Hash, Sha256};
 use bytes::Bytes;
 use futures::{stream, StreamExt, TryStreamExt};
 use get_size::GetSize;
+use pathlink::{label, path_label, PathBuf, PathLabel};
 
-use crate::{Cond, Scalar, TCRef};
+use crate::{Cond, Scalar, TCRef, MAX_SCALAR_DEPTH};
+use tc_value::{class::NativeClass, ValueType};
+
+const RESOURCE_PATH: PathLabel = path_label(&["resource"]);
+const SERVICE_PATH: PathLabel = path_label(&["service", "test", "test", "1.0.0"]);
 
 async fn decode(binary: bool, input: Vec<u8>) -> Result<Scalar, String> {
     let source = stream::iter(input.chunks(17).map(Bytes::copy_from_slice));
@@ -57,9 +62,9 @@ async fn canonical_depth_and_lifecycle_use_the_worker_stack() {
     tokio::spawn(async {
         for binary in [false, true] {
             for map in [false, true] {
-                for depth in [2, 64, 65] {
+                for depth in [2, MAX_SCALAR_DEPTH, MAX_SCALAR_DEPTH + 1] {
                     let value = decode(binary, wire(binary, map, depth)).await;
-                    if depth == 65 {
+                    if depth > MAX_SCALAR_DEPTH {
                         assert!(value.is_err());
                         continue;
                     }
@@ -91,12 +96,12 @@ async fn canonical_depth_and_lifecycle_use_the_worker_stack() {
 async fn malformed_and_cancelled_deep_inputs_release_owned_state() {
     tokio::spawn(async {
         for binary in [false, true] {
-            let mut complete = wire(binary, false, 63);
+            let mut complete = wire(binary, false, MAX_SCALAR_DEPTH - 1);
             complete.insert(0, b'[');
             if !binary {
                 complete.push(b',');
             }
-            for prefix in [vec![b'['; 64], complete] {
+            for prefix in [vec![b'['; MAX_SCALAR_DEPTH], complete] {
                 let mut malformed = prefix.clone();
                 malformed.push(b'}');
                 assert!(decode(binary, malformed).await.is_err());
@@ -188,7 +193,7 @@ async fn wide_encoding_and_stream_drop_do_not_build_call_chains() {
 async fn nested_operation_forms_keep_wire_and_hash_identity() {
     tokio::spawn(async {
         let mut scalar = Scalar::default();
-        for depth in 0..32 {
+        for depth in 0..MAX_SCALAR_DEPTH / 2 {
             scalar = if depth % 2 == 0 {
                 crate::OpDef::Post(vec![(format!("result{depth}").parse().unwrap(), scalar)]).into()
             } else {
@@ -230,7 +235,7 @@ async fn nested_operation_forms_keep_wire_and_hash_identity() {
             Hash::<Sha256>::hash(&reference),
             Hash::<Sha256>::hash((&a, &b))
         );
-        let subject = crate::Subject::Link("/service/test/test/1.0.0".parse().unwrap());
+        let subject = crate::Subject::Link(SERVICE_PATH.into());
         let call = crate::OpRef::Put((subject.clone(), a.clone(), b.clone()));
         assert_eq!(
             Hash::<Sha256>::hash(&call),
@@ -243,6 +248,24 @@ async fn nested_operation_forms_keep_wire_and_hash_identity() {
 
 #[tokio::test]
 async fn operation_argument_maps_and_reference_tails_preserve_their_contracts() {
+    // Only exact type paths select typed decoding; nearby paths remain subjects.
+    for subject in [
+        PathBuf::from(crate::SCALAR_REF_PREFIX),
+        PathBuf::from(crate::TCREF_COND).append(label("extra")),
+        PathBuf::from(crate::OPREF_GET).append(label("extra")),
+        PathBuf::from(crate::OPREF_PREFIX).append(label("unknown")),
+    ] {
+        let wire = format!("{{\"{subject}\":[null]}}");
+        let scalar = decode(false, wire.into_bytes()).await.unwrap();
+        let Scalar::Ref(reference) = scalar else {
+            panic!("call reference for {subject}")
+        };
+        let TCRef::Op(crate::OpRef::Get((crate::Subject::Link(link), _))) = *reference else {
+            panic!("GET subject for {subject}")
+        };
+        assert_eq!(link.path(), &subject);
+    }
+
     let scalar = decode(false, br#"{"$f":{"x":1,"x":2}}"#.to_vec())
         .await
         .unwrap();
@@ -259,6 +282,41 @@ async fn operation_argument_maps_and_reference_tails_preserve_their_contracts() 
     let call: crate::OpRef = destream_json::decode((), source).await.unwrap();
     assert!(matches!(call, crate::OpRef::Get(_)));
     assert!(decode(false, wire.to_vec()).await.is_err());
+
+    for (path, payload, expected) in [
+        (crate::TCREF_AFTER, "[]", "length"),
+        (crate::TCREF_AFTER, "[null,null,null]", "too many"),
+        (crate::TCREF_COND, "[null,null,null]", "expected {"),
+        (crate::TCREF_FOR_EACH, "[null,null,1,null]", "too many"),
+        (crate::TCREF_FOR_EACH, "[null,null,1]", "item_name"),
+        (crate::OPDEF_POST, r#"[["result",null,null]]"#, "length"),
+    ] {
+        let wire = format!("{{\"{path}\":{payload}}}");
+        let error = decode(false, wire.as_bytes().to_vec()).await.unwrap_err();
+        assert!(error.contains(expected), "{wire}: {error}");
+    }
+
+    let resource = format!("{{\"{RESOURCE_PATH}\":[]}}");
+    for (payload, levels) in [
+        ("null", 0),
+        (resource.as_str(), 0),
+        (r#"{"$name":[]}"#, 1),
+        ("[]", 1),
+        ("{}", 1),
+    ] {
+        let depth = MAX_SCALAR_DEPTH - levels;
+        let wire = format!("{}{}{}", "[".repeat(depth), payload, "]".repeat(depth));
+        assert!(
+            decode(false, wire.as_bytes().to_vec()).await.is_ok(),
+            "{payload}"
+        );
+        assert!(
+            decode(false, format!("[{wire}]").into_bytes())
+                .await
+                .is_err(),
+            "{payload}"
+        );
+    }
 }
 
 #[test]
@@ -308,11 +366,12 @@ fn value_conversion_checks_combined_tuple_depth_before_construction() {
 async fn mixed_codec_nesting_uses_one_structural_allowance() {
     tokio::spawn(async {
         for binary in [false, true] {
-            for depth in [32, 33] {
+            for depth in [MAX_SCALAR_DEPTH / 2, MAX_SCALAR_DEPTH / 2 + 1] {
                 // Typed Values remain Values instead of decoding as Scalar tuples.
                 let value_wire = format!(
-                    "{{\"/state/scalar/value/tuple\":{}}}",
-                    String::from_utf8(wire(false, false, 32)).unwrap()
+                    "{{\"{}\":{}}}",
+                    ValueType::Tuple.path(),
+                    String::from_utf8(wire(false, false, MAX_SCALAR_DEPTH / 2)).unwrap()
                 );
                 let json = format!("{}{}{}", "[".repeat(depth), value_wire, "]".repeat(depth));
                 let bytes = if binary {
@@ -323,9 +382,12 @@ async fn mixed_codec_nesting_uses_one_structural_allowance() {
                 } else {
                     json.into_bytes()
                 };
-                assert_eq!(decode(binary, bytes).await.is_ok(), depth == 32);
+                assert_eq!(
+                    decode(binary, bytes).await.is_ok(),
+                    depth == MAX_SCALAR_DEPTH / 2
+                );
             }
-            for depth in [64, 65] {
+            for depth in [MAX_SCALAR_DEPTH, MAX_SCALAR_DEPTH + 1] {
                 let mut reference = TCRef::Id("$condition".parse().unwrap());
                 for _ in 0..depth {
                     reference = TCRef::Cond(Box::new(Cond::new(
@@ -361,10 +423,10 @@ async fn mixed_codec_nesting_uses_one_structural_allowance() {
                 };
                 assert_eq!(
                     result.is_ok(),
-                    depth == 64,
+                    depth == MAX_SCALAR_DEPTH,
                     "reference depth {depth}: {result:?}"
                 );
-                if depth == 64 {
+                if depth == MAX_SCALAR_DEPTH {
                     let decoded = result.unwrap();
                     assert_eq!(decoded, reference);
                     let cloned = decoded.clone();
@@ -414,4 +476,125 @@ fn streamed_container_hashes_preserve_native_boundaries() {
         assert_eq!(Hash::<Sha256>::hash(&scalar), expected);
         assert_eq!(scalar.clone(), scalar);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recursive_forms_enforce_depth_before_descending() {
+    tokio::spawn(async {
+        for (name, levels) in [
+            ("tuple", 1),
+            ("map", 1),
+            ("cond", 2),
+            ("after", 2),
+            ("while", 2),
+            ("for_each", 2),
+            ("get", 3),
+            ("put", 3),
+            ("post", 3),
+            ("delete", 3),
+            ("get_def", 2),
+            ("put_def", 2),
+            ("post_def", 2),
+            ("delete_def", 2),
+        ] {
+            let mut json = "null".to_owned();
+            for index in 0..MAX_SCALAR_DEPTH / levels {
+                json = match name {
+                    "tuple" => format!("[{json}]"),
+                    "map" => format!("{{\"item\":{json}}}"),
+                    "cond" => format!(
+                        "{{\"{}\":[{{\"$condition\":[]}},null,{json}]}}",
+                        crate::TCREF_COND
+                    ),
+                    "after" => format!("{{\"{}\":[null,{json}]}}", crate::TCREF_AFTER),
+                    "while" => format!("{{\"{}\":[null,null,{json}]}}", crate::TCREF_WHILE),
+                    "for_each" => format!(
+                        "{{\"{}\":[null,{json},\"item{index}\"]}}",
+                        crate::TCREF_FOR_EACH
+                    ),
+                    "get" => format!("{{\"$call\":[{json}]}}"),
+                    "put" => format!("{{\"$call\":[null,{json}]}}"),
+                    "post" => format!("{{\"$call\":{{\"param\":{json}}}}}"),
+                    "delete" => format!("{{\"{}\":[\"$call\",{json}]}}", crate::OPREF_DELETE),
+                    "get_def" => format!(
+                        "{{\"{}\":[\"key{index}\",[[\"result{index}\",{json}]]]}}",
+                        crate::OPDEF_GET
+                    ),
+                    "put_def" => format!(
+                        "{{\"{}\":[\"key{index}\",\"value{index}\",[[\"result{index}\",{json}]]]}}",
+                        crate::OPDEF_PUT
+                    ),
+                    "post_def" => {
+                        format!("{{\"{}\":[[\"result{index}\",{json}]]}}", crate::OPDEF_POST)
+                    }
+                    "delete_def" => format!(
+                        "{{\"{}\":[\"key{index}\",[[\"result{index}\",{json}]]]}}",
+                        crate::OPDEF_DELETE
+                    ),
+                    _ => unreachable!(),
+                };
+            }
+            for _ in 0..MAX_SCALAR_DEPTH % levels {
+                json = format!("[{json}]");
+            }
+            for binary in [false, true] {
+                let bytes = if binary {
+                    json.replace("\":", "\"")
+                        .replace(',', "")
+                        .replace("null", "\u{1}")
+                        .into_bytes()
+                } else {
+                    json.as_bytes().to_vec()
+                };
+                let result = decode(binary, bytes.clone()).await;
+                assert!(result.is_ok(), "{name}, binary={binary}: {result:?}");
+                let mut excessive = vec![b'['];
+                excessive.extend_from_slice(&bytes);
+                excessive.push(b']');
+                let error = decode(binary, excessive).await.unwrap_err();
+                assert!(
+                    error.contains("nesting"),
+                    "{name}, binary={binary}: {error}"
+                );
+
+                // Suspend at the innermost value with every enclosing call live.
+                let leaf = if binary {
+                    bytes.iter().rposition(|byte| *byte == 1).unwrap()
+                } else {
+                    bytes
+                        .windows(4)
+                        .rposition(|chunk| chunk == b"null")
+                        .unwrap()
+                };
+                let owner = Arc::new(());
+                let observer = Arc::downgrade(&owner);
+                let source = stream::iter([Bytes::copy_from_slice(&bytes[..leaf])])
+                    .chain(stream::pending())
+                    .inspect(move |_| {
+                        let _ = &owner;
+                    });
+                let pending = async move {
+                    if binary {
+                        tbon::de::decode::<_, Scalar>((), source)
+                            .await
+                            .map_err(|error| error.to_string())
+                    } else {
+                        destream_json::decode::<_, Scalar>((), source)
+                            .await
+                            .map_err(|error| error.to_string())
+                    }
+                };
+                {
+                    let mut pending = std::pin::pin!(pending);
+                    assert!(
+                        futures::poll!(&mut pending).is_pending(),
+                        "{name}, binary={binary}"
+                    );
+                }
+                assert!(observer.upgrade().is_none(), "{name}, binary={binary}");
+            }
+        }
+    })
+    .await
+    .unwrap();
 }
