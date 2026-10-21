@@ -1,29 +1,36 @@
 use std::collections::BTreeSet;
-use std::str::FromStr;
 
 use async_hash::{Digest, Hash, Output};
-use destream::{de, en};
-use pathlink::PathBuf;
 
-use crate::{Id, IdRef, Scalar};
-use tc_value::Value;
+use crate::{Id, IdRef, Scalar, Subject};
+use tc_error::TCResult;
 
-/// A reference to a scalar value.
-///
-/// v2 supports op references (`TCRef::Op`), scope IDs (`TCRef::Id`), and flow control.
-///
-/// ## v1-compatible JSON semantics
-///
-/// Encoded as the underlying [`crate::OpRef`] map (no wrapper).
-#[derive(Clone, Debug, PartialEq)]
+/// A reference to a scalar value, with ordinary recursive ownership.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone, PartialEq)]
 pub enum TCRef {
-    Op(crate::op::OpRef),
+    Op(crate::OpRef),
     Id(IdRef),
     Cond(Box<Cond>),
     After(Box<After>),
     While(Box<While>),
     ForEach(Box<ForEach>),
+}
+
+impl std::fmt::Debug for TCRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Op(crate::OpRef::Post((subject, params))) => {
+                write!(f, "Op(Post(({subject:?}, {:?})))", **params)
+            }
+            Self::Op(value) => write!(f, "Op({value:?})"),
+            Self::Id(value) => write!(f, "Id({value:?})"),
+            Self::Cond(value) => write!(f, "Cond({value:?})"),
+            Self::After(value) => write!(f, "After({value:?})"),
+            Self::While(value) => write!(f, "While({value:?})"),
+            Self::ForEach(value) => write!(f, "ForEach({value:?})"),
+        }
+    }
 }
 
 /// A conditional reference with scalar branches.
@@ -93,9 +100,139 @@ impl ForEach {
     }
 }
 
+impl get_size::GetSize for TCRef {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Id(value) => value.get_heap_size(),
+            Self::Op(value) => value.get_heap_size(),
+            Self::Cond(value) => {
+                std::mem::size_of::<Cond>()
+                    + value.cond.get_heap_size()
+                    + value.then.get_heap_size()
+                    + value.or_else.get_heap_size()
+            }
+            Self::After(value) => {
+                std::mem::size_of::<After>()
+                    + value.when.get_heap_size()
+                    + value.then.get_heap_size()
+            }
+            Self::While(value) => {
+                std::mem::size_of::<While>()
+                    + value.cond.get_heap_size()
+                    + value.closure.get_heap_size()
+                    + value.state.get_heap_size()
+            }
+            Self::ForEach(value) => {
+                std::mem::size_of::<ForEach>()
+                    + value.items.get_heap_size()
+                    + value.op.get_heap_size()
+                    + value.item_name.get_heap_size()
+            }
+        }
+    }
+}
+
 impl TCRef {
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
-        crate::scalar::collect_ref_requires(self, required)
+        self.requires_in(&BTreeSet::new(), required)
+    }
+
+    pub(crate) fn requires_in(&self, bound: &BTreeSet<Id>, required: &mut BTreeSet<Id>) {
+        match self {
+            Self::Id(id) => {
+                if id.as_str() != "self" && !bound.contains(id.id()) {
+                    required.insert(id.id().clone());
+                }
+            }
+            Self::Op(op) => op.requires_in(bound, required),
+            Self::Cond(value) => {
+                value.cond.requires_in(bound, required);
+                value.then.requires_in(bound, required);
+                value.or_else.requires_in(bound, required);
+            }
+            Self::After(value) => {
+                value.when.requires_in(bound, required);
+                value.then.requires_in(bound, required);
+            }
+            Self::While(value) => {
+                let mut callback = bound.clone();
+                callback.insert("state".parse().expect("reserved callback Id"));
+                value.cond.requires_in(&callback, required);
+                value.closure.requires_in(&callback, required);
+                value.state.requires_in(bound, required);
+            }
+            Self::ForEach(value) => {
+                let mut body = bound.clone();
+                body.insert(value.item_name.clone());
+                value.op.requires_in(&body, required);
+                value.items.requires_in(bound, required);
+            }
+        }
+    }
+
+    pub(crate) fn validate_in(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
+        match self {
+            Self::Id(_) => {}
+            Self::Op(op) => op.validate_in(visible)?,
+            Self::Cond(value) => {
+                value.cond.validate_in(visible)?;
+                value.then.validate_in(visible)?;
+                value.or_else.validate_in(visible)?;
+            }
+            Self::After(value) => {
+                value.when.validate_in(visible)?;
+                value.then.validate_in(visible)?;
+            }
+            Self::While(value) => {
+                let mut callback = visible.clone();
+                crate::op::bind(
+                    &mut callback,
+                    &mut BTreeSet::new(),
+                    &"state".parse().expect("reserved callback Id"),
+                    "While callback parameter",
+                )?;
+                value.cond.validate_in(&callback)?;
+                value.closure.validate_in(&callback)?;
+                value.state.validate_in(visible)?;
+            }
+            Self::ForEach(value) => {
+                let mut body = visible.clone();
+                crate::op::bind(
+                    &mut body,
+                    &mut BTreeSet::new(),
+                    &value.item_name,
+                    "ForEach item",
+                )?;
+                value.op.validate_in(&body)?;
+                value.items.validate_in(visible)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn map_subjects(&mut self, visitor: &mut impl FnMut(&mut Subject)) {
+        match self {
+            Self::Id(_) => {}
+            Self::Op(op) => op.map_subjects(visitor),
+            Self::Cond(value) => {
+                value.or_else.map_subjects(visitor);
+                value.then.map_subjects(visitor);
+                value.cond.map_subjects(visitor);
+            }
+            Self::After(value) => {
+                value.then.map_subjects(visitor);
+                value.when.map_subjects(visitor);
+            }
+            Self::While(value) => {
+                value.state.map_subjects(visitor);
+                value.closure.map_subjects(visitor);
+                value.cond.map_subjects(visitor);
+            }
+            Self::ForEach(value) => {
+                value.op.map_subjects(visitor);
+                value.items.map_subjects(visitor);
+            }
+        }
     }
 
     pub(crate) fn visit_referenced_methods(
@@ -103,25 +240,25 @@ impl TCRef {
         visitor: &mut impl FnMut(&pathlink::Link, crate::Method),
     ) {
         match self {
-            Self::Op(op) => op.visit_referenced_methods(visitor),
             Self::Id(_) => {}
-            Self::Cond(cond) => {
-                cond.cond.visit_referenced_methods(visitor);
-                cond.then.visit_referenced_methods(visitor);
-                cond.or_else.visit_referenced_methods(visitor);
+            Self::Op(op) => op.visit_referenced_methods(visitor),
+            Self::Cond(value) => {
+                value.cond.visit_referenced_methods(visitor);
+                value.then.visit_referenced_methods(visitor);
+                value.or_else.visit_referenced_methods(visitor);
             }
-            Self::After(after) => {
-                after.when.visit_referenced_methods(visitor);
-                after.then.visit_referenced_methods(visitor);
+            Self::After(value) => {
+                value.when.visit_referenced_methods(visitor);
+                value.then.visit_referenced_methods(visitor);
             }
-            Self::While(while_ref) => {
-                while_ref.cond.visit_referenced_methods(visitor);
-                while_ref.closure.visit_referenced_methods(visitor);
-                while_ref.state.visit_referenced_methods(visitor);
+            Self::While(value) => {
+                value.cond.visit_referenced_methods(visitor);
+                value.closure.visit_referenced_methods(visitor);
+                value.state.visit_referenced_methods(visitor);
             }
-            Self::ForEach(for_each) => {
-                for_each.items.visit_referenced_methods(visitor);
-                for_each.op.visit_referenced_methods(visitor);
+            Self::ForEach(value) => {
+                value.items.visit_referenced_methods(visitor);
+                value.op.visit_referenced_methods(visitor);
             }
         }
     }
@@ -130,242 +267,12 @@ impl TCRef {
 impl<D: Digest> Hash<D> for &TCRef {
     fn hash(self) -> Output<D> {
         match self {
-            TCRef::Op(op) => Hash::<D>::hash(op),
-            TCRef::Id(id) => Hash::<D>::hash(id),
-            TCRef::Cond(cond) => Hash::<D>::hash((&cond.cond, &cond.then, &cond.or_else)),
-            TCRef::After(after) => Hash::<D>::hash((&after.when, &after.then)),
-            TCRef::While(while_ref) => {
-                Hash::<D>::hash((&while_ref.cond, &while_ref.closure, &while_ref.state))
-            }
-            TCRef::ForEach(for_each) => {
-                Hash::<D>::hash((&for_each.items, &for_each.op, &for_each.item_name))
-            }
+            TCRef::Id(value) => Hash::<D>::hash(value),
+            TCRef::Op(value) => Hash::<D>::hash(value),
+            TCRef::Cond(value) => Hash::<D>::hash((&value.cond, &value.then, &value.or_else)),
+            TCRef::After(value) => Hash::<D>::hash((&value.when, &value.then)),
+            TCRef::While(value) => Hash::<D>::hash((&value.cond, &value.closure, &value.state)),
+            TCRef::ForEach(value) => Hash::<D>::hash((&value.items, &value.op, &value.item_name)),
         }
     }
-}
-
-impl de::FromStream for TCRef {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct RefVisitor;
-
-        impl de::Visitor for RefVisitor {
-            type Value = TCRef;
-
-            fn expecting() -> &'static str {
-                "a Ref, like {\"$id\": []} or {\"/path/to/op\": [\"key\"]}"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let key = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("expected ref map key"))?;
-
-                decode_tcref_map_entry(key, &mut map).await
-            }
-        }
-
-        decoder.decode_map(RefVisitor).await
-    }
-}
-
-impl<'en> en::IntoStream<'en> for TCRef {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeMap;
-
-        if let Self::Op(op) = self {
-            return op.into_stream(encoder);
-        }
-        let mut map = encoder.encode_map(Some(1))?;
-        match self {
-            Self::Op(_) => unreachable!(),
-            Self::Id(id) => map.encode_entry(id.to_string(), Vec::<()>::new())?,
-            Self::Cond(cond) => map.encode_entry(
-                PathBuf::from(crate::TCREF_COND).to_string(),
-                (cond.cond, cond.then, cond.or_else),
-            )?,
-            Self::After(after) => map.encode_entry(
-                PathBuf::from(crate::TCREF_AFTER).to_string(),
-                (after.when, after.then),
-            )?,
-            Self::While(while_ref) => map.encode_entry(
-                PathBuf::from(crate::TCREF_WHILE).to_string(),
-                (while_ref.cond, while_ref.closure, while_ref.state),
-            )?,
-            Self::ForEach(for_each) => map.encode_entry(
-                PathBuf::from(crate::TCREF_FOR_EACH).to_string(),
-                (for_each.items, for_each.op, for_each.item_name.to_string()),
-            )?,
-        }
-        map.end()
-    }
-}
-
-impl<'en> en::ToStream<'en> for TCRef {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeMap;
-
-        if let Self::Op(op) = self {
-            return op.to_stream(encoder);
-        }
-        let mut map = encoder.encode_map(Some(1))?;
-        match self {
-            Self::Op(_) => unreachable!(),
-            Self::Id(id) => map.encode_entry(id.to_string(), Vec::<()>::new())?,
-            Self::Cond(cond) => map.encode_entry(
-                PathBuf::from(crate::TCREF_COND).to_string(),
-                (&cond.cond, &cond.then, &cond.or_else),
-            )?,
-            Self::After(after) => map.encode_entry(
-                PathBuf::from(crate::TCREF_AFTER).to_string(),
-                (&after.when, &after.then),
-            )?,
-            Self::While(while_ref) => map.encode_entry(
-                PathBuf::from(crate::TCREF_WHILE).to_string(),
-                (&while_ref.cond, &while_ref.closure, &while_ref.state),
-            )?,
-            Self::ForEach(for_each) => map.encode_entry(
-                PathBuf::from(crate::TCREF_FOR_EACH).to_string(),
-                (
-                    &for_each.items,
-                    &for_each.op,
-                    for_each.item_name.to_string(),
-                ),
-            )?,
-        }
-        map.end()
-    }
-}
-
-pub(crate) async fn decode_tcref_map_entry<A: de::MapAccess>(
-    key: String,
-    map: &mut A,
-) -> Result<TCRef, A::Error> {
-    let key_path = if key.starts_with('/') {
-        PathBuf::from_str(&key).ok()
-    } else {
-        None
-    };
-    if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_COND)) {
-        let items = map.next_value::<Vec<Scalar>>(()).await?;
-        let mut iter = items.into_iter();
-        let (cond, then, or_else) = match (iter.next(), iter.next(), iter.next(), iter.next()) {
-            (Some(cond), Some(then), Some(or_else), None) => (cond, then, or_else),
-            _ => {
-                return Err(de::Error::custom(
-                    "invalid Cond params (expected 3 elements)",
-                ));
-            }
-        };
-
-        let cond = match cond {
-            Scalar::Ref(r) => *r,
-            other => {
-                return Err(de::Error::custom(format!(
-                    "invalid Cond condition (expected ref, got {other:?})"
-                )));
-            }
-        };
-
-        while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-        }
-
-        return Ok(TCRef::Cond(Box::new(Cond::new(cond, then, or_else))));
-    }
-
-    if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_AFTER)) {
-        let items = map.next_value::<Vec<Scalar>>(()).await?;
-        let mut iter = items.into_iter();
-        let (when, then) = match (iter.next(), iter.next(), iter.next()) {
-            (Some(when), Some(then), None) => (when, then),
-            _ => {
-                return Err(de::Error::custom(
-                    "invalid After params (expected 2 elements)",
-                ));
-            }
-        };
-
-        while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-        }
-
-        return Ok(TCRef::After(Box::new(After::new(when, then))));
-    }
-
-    if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_WHILE)) {
-        let items = map.next_value::<Vec<Scalar>>(()).await?;
-        let mut iter = items.into_iter();
-        let (cond, closure, state) = match (iter.next(), iter.next(), iter.next(), iter.next()) {
-            (Some(cond), Some(closure), Some(state), None) => (cond, closure, state),
-            _ => {
-                return Err(de::Error::custom(
-                    "invalid While ref params (expected 3 elements)",
-                ));
-            }
-        };
-
-        while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-        }
-
-        return Ok(TCRef::While(Box::new(While::new(cond, closure, state))));
-    }
-
-    if key_path.as_ref() == Some(&PathBuf::from(crate::TCREF_FOR_EACH)) {
-        let items = map.next_value::<Vec<Scalar>>(()).await?;
-        let mut iter = items.into_iter();
-        let (items, op, item_name) = match (iter.next(), iter.next(), iter.next(), iter.next()) {
-            (Some(items), Some(op), Some(item_name), None) => (items, op, item_name),
-            _ => {
-                return Err(de::Error::custom(
-                    "invalid ForEach ref params (expected 3 elements)",
-                ));
-            }
-        };
-
-        let item_name = match item_name {
-            Scalar::Value(Value::String(raw)) => raw
-                .parse::<Id>()
-                .map_err(|err| de::Error::custom(err.to_string()))?,
-            other => {
-                return Err(de::Error::custom(format!(
-                    "invalid ForEach item_name (expected string, got {other:?})"
-                )));
-            }
-        };
-
-        while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-        }
-
-        return Ok(TCRef::ForEach(Box::new(ForEach::new(items, op, item_name))));
-    }
-
-    if key.starts_with('$') {
-        let args = map.next_value::<crate::op::OpArgs>(()).await?;
-        if let crate::op::OpArgs::Seq(items) = &args {
-            if items.is_empty() {
-                let id_ref =
-                    IdRef::from_str(&key).map_err(|err| de::Error::custom(err.to_string()))?;
-                return Ok(TCRef::Id(id_ref));
-            }
-        }
-
-        let subject = crate::scalar::subject_from_str(&key)
-            .map_err(|err| de::Error::custom(err.to_string()))?;
-        let op = crate::op::opref_from_subject_args(subject, args)?;
-        return Ok(TCRef::Op(op));
-    }
-
-    let op = crate::op::decode_opref_map_entry(key, map).await?;
-    Ok(TCRef::Op(op))
 }

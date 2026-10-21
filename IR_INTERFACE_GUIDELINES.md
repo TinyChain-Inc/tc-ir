@@ -18,12 +18,23 @@ belongs downstream.
 ## Algebra
 
 `Scalar`, `TCRef`, `OpRef`, and `OpDef` are the canonical graph vocabulary.
+These types are ordinary enums; match their variants directly. Native ownership,
+cloning, equality, hashing, formatting, and destruction recurse normally.
+Codecs enforce at most 16 structural levels, carrying the remaining allowance
+across nested IR and Value decoding. Wire envelopes and sibling counts do not
+consume structural depth. Trusted native constructors and runtime composition
+must respect this contract; codec validation alone does not bound program-generated
+nesting. Execution and streaming traversal retain their separate stack-safety mechanisms.
+
 Maps and tuples compose these forms recursively. Control flow is expressed by
 ordinary `TCRef` variants; no adapter or application-specific scalar variant is
 permitted.
 
 Lexical-requirement discovery and referenced-method visitation are intrinsic
-recursive queries on these owning values. `requires` reports identifiers used
+recursive queries on these owning values. Subject rewriting and lexical validation
+use the same owner-local delegation, borrowing scopes and cloning only when
+introducing bindings. These synchronous inspections rely on the structural
+nesting contract, not an arbitrary-depth traversal guarantee. `requires` reports identifiers used
 but not bound by the inspected form; it neither creates nor mutates a runtime
 namespace and is not an execution plan. The reference visitor reports
 individual Link/verb occurrences without classification or aggregation; they
@@ -137,13 +148,20 @@ route and duplicate delegation.
 ## Hashing and codecs
 
 Owned and borrowed streaming codecs use the same representation. Borrowed codecs
-delegate recursively to their semantic children without cloning the expression
-tree; fixed argument sequences use native tuples.
+traverse their semantic children without cloning the expression tree. Fixed
+argument sequences retain their explicit field order and cardinality.
 
 The algebra implements `async_hash::Hash` directly. Maps use deterministic key
 order and sequences preserve their semantic order. These are structural hashes
 of decoded forms, not application digest policy. Hashing must not depend on JSON
 whitespace or transport encoding.
+
+IR decoding delegates to concrete typed functions over shallow containers. A
+remaining-depth allowance bounds recursive polling before entering each native
+structure; siblings and wire envelopes do not consume it. Recursive future edges
+are boxed for finite future sizes, not as a substitute for the depth limit.
+Encoding retains its owned or borrowing event stream; framing and leaf parsing
+remain with `destream`.
 
 Every `FromStream` implementation accepts the form emitted by its `IntoStream`
 implementation. Encoding must not implement equality, hashing, cloning,

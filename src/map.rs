@@ -19,6 +19,12 @@ pub struct Map<T> {
     inner: BTreeMap<Id, T>,
 }
 
+impl<T: get_size::GetSize> get_size::GetSize for Map<T> {
+    fn get_heap_size(&self) -> usize {
+        self.inner.get_heap_size()
+    }
+}
+
 impl<T> Map<T> {
     /// Construct a new [`Map`].
     pub fn new() -> Self {

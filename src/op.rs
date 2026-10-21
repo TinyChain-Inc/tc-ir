@@ -1,10 +1,9 @@
 use std::collections::BTreeSet;
-use std::str::FromStr;
 
-use crate::{Id, Map, Method, Scalar, Subject};
 use async_hash::{Digest, Hash, Output};
-use destream::{de, en, EncodeMap};
 use pathlink::PathBuf;
+
+use crate::{Id, Map, Scalar, Subject};
 use tc_error::{TCError, TCResult};
 
 /// The data defining a reference to a GET op.
@@ -21,10 +20,9 @@ pub type DeleteRef = (Subject, Scalar);
 
 /// A reference to an op.
 ///
-/// This is a structural port of the v1 `OpRef` enum. Resolution/execution is implemented by the
-/// host kernel and is intentionally not part of this type definition.
+/// Resolution and execution belong to the host kernel.
 ///
-/// ## v1-compatible JSON semantics
+/// ## Wire representation
 ///
 /// Encoded as a single-entry map:
 ///
@@ -68,7 +66,7 @@ impl OpDefType {
         }
     }
 
-    fn path(&self) -> PathBuf {
+    pub(crate) fn path(&self) -> PathBuf {
         match self {
             Self::Get => PathBuf::from(crate::OPDEF_GET),
             Self::Put => PathBuf::from(crate::OPDEF_PUT),
@@ -91,11 +89,39 @@ pub enum OpDef {
     Delete(DeleteOp),
 }
 
+impl get_size::GetSize for OpRef {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Get((subject, key)) | Self::Delete((subject, key)) => {
+                subject.get_heap_size() + key.get_heap_size()
+            }
+            Self::Put((subject, key, value)) => {
+                subject.get_heap_size() + key.get_heap_size() + value.get_heap_size()
+            }
+            Self::Post((subject, params)) => subject.get_heap_size() + params.get_heap_size(),
+        }
+    }
+}
+
+impl get_size::GetSize for OpDef {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Get((key, form)) | Self::Delete((key, form)) => {
+                key.get_heap_size() + form.get_heap_size()
+            }
+            Self::Put((key, value, form)) => {
+                key.get_heap_size() + value.get_heap_size() + form.get_heap_size()
+            }
+            Self::Post(form) => form.get_heap_size(),
+        }
+    }
+}
+
 impl OpDef {
     /// Bind concrete references beneath this resource to its native `$self`.
     /// Replicated methods use this so their local writes are not forwarded again.
     pub fn reference_self(mut self, resource: &pathlink::Link) -> Self {
-        crate::scalar::map_subjects(&mut self, &mut |subject| {
+        self.map_subjects(&mut |subject| {
             if let Subject::Link(link) = subject {
                 if link.host() == resource.host() && link.path().starts_with(resource.path()) {
                     *subject = Subject::Ref(
@@ -111,7 +137,7 @@ impl OpDef {
     /// Bind `$self` operations to the owning resource's public invocation boundary.
     /// Composed methods use this so nested writes participate in replication.
     pub fn dereference_self(mut self, resource: &pathlink::Link) -> Self {
-        crate::scalar::map_subjects(&mut self, &mut |subject| {
+        self.map_subjects(&mut |subject| {
             if let Subject::Ref(id, suffix) = subject {
                 if id.as_str() == "self" {
                     let mut link = resource.clone();
@@ -138,7 +164,7 @@ impl OpDef {
         self.form().last().map(|(id, _)| id)
     }
 
-    fn class(&self) -> OpDefType {
+    pub(crate) fn class(&self) -> OpDefType {
         match self {
             Self::Get(_) => OpDefType::Get,
             Self::Put(_) => OpDefType::Put,
@@ -148,12 +174,77 @@ impl OpDef {
     }
 
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
-        crate::scalar::collect_op_requires(self, required)
+        self.requires_in(&BTreeSet::new(), required)
     }
 
     /// Validate that this operation is a single-assignment lexical scope.
     pub fn validate(&self) -> TCResult<()> {
-        crate::scalar::validate_op(self, &BTreeSet::new())
+        self.validate_in(&BTreeSet::new())
+    }
+
+    pub(crate) fn requires_in(&self, bound: &BTreeSet<Id>, required: &mut BTreeSet<Id>) {
+        let mut local = bound.clone();
+        match self {
+            Self::Get((key, _)) | Self::Delete((key, _)) => {
+                local.insert(key.clone());
+            }
+            Self::Put((key, value, _)) => {
+                local.insert(key.clone());
+                local.insert(value.clone());
+            }
+            Self::Post(_) => {}
+        }
+        local.extend(self.form().iter().map(|(id, _)| id.clone()));
+        for (_, value) in self.form() {
+            value.requires_in(&local, required);
+        }
+    }
+
+    pub(crate) fn validate_in(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
+        if self.form().is_empty() {
+            return Err(TCError::bad_request(
+                "an OpDef must define at least one provider",
+            ));
+        }
+
+        let mut scope = visible.clone();
+        let mut local = BTreeSet::new();
+        match self {
+            Self::Get((key, _)) | Self::Delete((key, _)) => {
+                bind(&mut scope, &mut local, key, "parameter")?;
+            }
+            Self::Put((key, value, _)) => {
+                bind(&mut scope, &mut local, key, "parameter")?;
+                bind(&mut scope, &mut local, value, "parameter")?;
+            }
+            Self::Post(_) => {}
+        }
+        for (id, _) in self.form() {
+            bind(&mut scope, &mut local, id, "provider")?;
+        }
+        for (_, value) in self.form() {
+            value.validate_in(&scope)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn map_subjects(&mut self, visitor: &mut impl FnMut(&mut Subject)) {
+        let form = match self {
+            Self::Get((_, form)) | Self::Delete((_, form)) => form,
+            Self::Put((_, _, form)) | Self::Post(form) => form,
+        };
+        for (_, value) in form.iter_mut().rev() {
+            value.map_subjects(visitor);
+        }
+    }
+
+    pub(crate) fn visit_referenced_methods(
+        &self,
+        visitor: &mut impl FnMut(&pathlink::Link, crate::Method),
+    ) {
+        for (_, value) in self.form() {
+            value.visit_referenced_methods(visitor);
+        }
     }
 }
 
@@ -187,32 +278,95 @@ pub(crate) fn bind(
 
 impl OpRef {
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
-        crate::scalar::collect_op_ref_requires(self, required)
+        self.requires_in(&BTreeSet::new(), required)
+    }
+
+    pub(crate) fn requires_in(&self, bound: &BTreeSet<Id>, required: &mut BTreeSet<Id>) {
+        let subject = match self {
+            Self::Get((subject, key)) | Self::Delete((subject, key)) => {
+                key.requires_in(bound, required);
+                subject
+            }
+            Self::Put((subject, key, value)) => {
+                key.requires_in(bound, required);
+                value.requires_in(bound, required);
+                subject
+            }
+            Self::Post((subject, params)) => {
+                for value in params.values() {
+                    value.requires_in(bound, required);
+                }
+                subject
+            }
+        };
+        if let Subject::Ref(id, _) = subject {
+            if id.as_str() != "self" && !bound.contains(id.id()) {
+                required.insert(id.id().clone());
+            }
+        }
+    }
+
+    pub(crate) fn validate_in(&self, visible: &BTreeSet<Id>) -> TCResult<()> {
+        match self {
+            Self::Get((_, key)) | Self::Delete((_, key)) => key.validate_in(visible)?,
+            Self::Put((_, key, value)) => {
+                key.validate_in(visible)?;
+                value.validate_in(visible)?;
+            }
+            Self::Post((_, params)) => {
+                for value in params.values() {
+                    value.validate_in(visible)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn map_subjects(&mut self, visitor: &mut impl FnMut(&mut Subject)) {
+        // Preserve subject-first rewriting and reverse argument visitation.
+        match self {
+            Self::Get((subject, key)) | Self::Delete((subject, key)) => {
+                visitor(subject);
+                key.map_subjects(visitor);
+            }
+            Self::Put((subject, key, value)) => {
+                visitor(subject);
+                value.map_subjects(visitor);
+                key.map_subjects(visitor);
+            }
+            Self::Post((subject, params)) => {
+                visitor(subject);
+                for value in params.values_mut().rev() {
+                    value.map_subjects(visitor);
+                }
+            }
+        }
     }
 
     pub(crate) fn visit_referenced_methods(
         &self,
-        visitor: &mut impl FnMut(&pathlink::Link, Method),
+        visitor: &mut impl FnMut(&pathlink::Link, crate::Method),
     ) {
-        let (method, subject) = match self {
+        // Report the enclosing call after its arguments, in source order.
+        let (subject, method) = match self {
             Self::Get((subject, key)) => {
                 key.visit_referenced_methods(visitor);
-                (Method::Get, subject)
+                (subject, crate::Method::Get)
+            }
+            Self::Delete((subject, key)) => {
+                key.visit_referenced_methods(visitor);
+                (subject, crate::Method::Delete)
             }
             Self::Put((subject, key, value)) => {
                 key.visit_referenced_methods(visitor);
                 value.visit_referenced_methods(visitor);
-                (Method::Put, subject)
+                (subject, crate::Method::Put)
             }
             Self::Post((subject, params)) => {
-                for scalar in params.values() {
-                    scalar.visit_referenced_methods(visitor);
+                for value in params.values() {
+                    value.visit_referenced_methods(visitor);
                 }
-                (Method::Post, subject)
-            }
-            Self::Delete((subject, key)) => {
-                key.visit_referenced_methods(visitor);
-                (Method::Delete, subject)
+                (subject, crate::Method::Post)
             }
         };
         if let Subject::Link(link) = subject {
@@ -243,452 +397,6 @@ impl<D: Digest> Hash<D> for &OpDef {
     }
 }
 
-impl de::FromStream for OpDef {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct OpDefVisitor;
-
-        impl de::Visitor for OpDefVisitor {
-            type Value = OpDef;
-
-            fn expecting() -> &'static str {
-                "an Op definition"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let key = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("expected Op definition type"))?;
-                let path =
-                    PathBuf::from_str(&key).map_err(|err| de::Error::custom(err.to_string()))?;
-                let op_def_type = OpDefType::from_path(&path).ok_or_else(|| {
-                    de::Error::custom("expected Op definition type, e.g. \"/state/scalar/op/get\"")
-                })?;
-
-                decode_opdef_map_entry(op_def_type, &mut map).await
-            }
-        }
-
-        decoder.decode_map(OpDefVisitor).await
-    }
-}
-
-impl<'en> en::IntoStream<'en> for OpDef {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeMap;
-
-        let mut map = encoder.encode_map(Some(1))?;
-        let class = self.class().path().to_string();
-        match self {
-            Self::Get(def) => map.encode_entry(class, def)?,
-            Self::Put(def) => map.encode_entry(class, def)?,
-            Self::Post(def) => map.encode_entry(class, def)?,
-            Self::Delete(def) => map.encode_entry(class, def)?,
-        }
-        map.end()
-    }
-}
-
-impl<'en> en::ToStream<'en> for OpDef {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeMap;
-
-        let mut map = encoder.encode_map(Some(1))?;
-        let class = self.class().path().to_string();
-        match self {
-            Self::Get(def) => map.encode_entry(class, def)?,
-            Self::Put(def) => map.encode_entry(class, def)?,
-            Self::Post(def) => map.encode_entry(class, def)?,
-            Self::Delete(def) => map.encode_entry(class, def)?,
-        }
-        map.end()
-    }
-}
-
-impl de::FromStream for OpRef {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct OpRefVisitor;
-
-        impl de::Visitor for OpRefVisitor {
-            type Value = OpRef;
-
-            fn expecting() -> &'static str {
-                "an OpRef map"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let key = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("expected OpRef, found empty map"))?;
-
-                decode_opref_map_entry(key, &mut map).await
-            }
-        }
-
-        decoder.decode_map(OpRefVisitor).await
-    }
-}
-
-impl<'en> en::IntoStream<'en> for OpRef {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let mut map = encoder.encode_map(Some(1))?;
-        match self {
-            Self::Get((subject, key)) => map.encode_entry(subject.to_string(), (key,))?,
-            Self::Put((subject, key, value)) => {
-                map.encode_entry(subject.to_string(), (key, value))?
-            }
-            Self::Post((subject, params)) => map.encode_entry(subject.to_string(), params)?,
-            Self::Delete((subject, key)) => map.encode_entry(
-                PathBuf::from(crate::OPREF_DELETE).to_string(),
-                (subject, key),
-            )?,
-        }
-        map.end()
-    }
-}
-
-impl<'en> en::ToStream<'en> for OpRef {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        let mut map = encoder.encode_map(Some(1))?;
-        match self {
-            Self::Get((subject, key)) => map.encode_entry(subject.to_string(), (key,))?,
-            Self::Put((subject, key, value)) => {
-                map.encode_entry(subject.to_string(), (key, value))?
-            }
-            Self::Post((subject, params)) => map.encode_entry(subject.to_string(), params)?,
-            Self::Delete((subject, key)) => map.encode_entry(
-                PathBuf::from(crate::OPREF_DELETE).to_string(),
-                (subject, key),
-            )?,
-        }
-        map.end()
-    }
-}
-
-/// Internal helper used to decode `OpRef` and `TCRef` argument shapes.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum OpArgs {
-    Map(Map<Scalar>),
-    Seq(Vec<Scalar>),
-}
-
-impl de::FromStream for OpArgs {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct ArgsVisitor;
-
-        impl de::Visitor for ArgsVisitor {
-            type Value = OpArgs;
-
-            fn expecting() -> &'static str {
-                "OpRef args (a sequence or map)"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut params = Map::<Scalar>::new();
-                while let Some(key) = map.next_key::<Id>(()).await? {
-                    let value = map.next_value::<Scalar>(()).await?;
-                    params.insert(key, value);
-                }
-                Ok(OpArgs::Map(params))
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut access: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut items = if let Some(len) = access.size_hint() {
-                    Vec::with_capacity(len)
-                } else {
-                    Vec::new()
-                };
-
-                while let Some(item) = access.next_element::<Scalar>(()).await? {
-                    items.push(item);
-                }
-
-                Ok(OpArgs::Seq(items))
-            }
-        }
-
-        decoder.decode_any(ArgsVisitor).await
-    }
-}
-
-pub(crate) async fn decode_opdef_map_entry<A: de::MapAccess>(
-    op_def_type: OpDefType,
-    map: &mut A,
-) -> Result<OpDef, A::Error> {
-    let op = match op_def_type {
-        OpDefType::Get => OpDef::Get(map.next_value::<GetOp>(()).await?),
-        OpDefType::Put => OpDef::Put(map.next_value::<PutOp>(()).await?),
-        OpDefType::Post => OpDef::Post(map.next_value::<PostOp>(()).await?),
-        OpDefType::Delete => OpDef::Delete(map.next_value::<DeleteOp>(()).await?),
-    };
-
-    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-        let _ = map.next_value::<de::IgnoredAny>(()).await?;
-    }
-
-    op.validate()
-        .map_err(|err| de::Error::custom(err.to_string()))?;
-
-    Ok(op)
-}
-
-pub(crate) fn opref_from_subject_args<E: de::Error>(
-    subject: Subject,
-    args: OpArgs,
-) -> Result<OpRef, E> {
-    match args {
-        OpArgs::Map(params) => Ok(OpRef::Post((subject, params))),
-        OpArgs::Seq(items) => match items.as_slice() {
-            [key] => Ok(OpRef::Get((subject, key.clone()))),
-            [key, value] => Ok(OpRef::Put((subject, key.clone(), value.clone()))),
-            _ => Err(de::Error::custom(
-                "invalid OpRef params (expected 1 or 2 elements)",
-            )),
-        },
-    }
-}
-
-pub(crate) async fn decode_opref_map_entry<A: de::MapAccess>(
-    key: String,
-    map: &mut A,
-) -> Result<OpRef, A::Error> {
-    let op = if key.starts_with('/') {
-        let path = PathBuf::from_str(&key).ok();
-
-        if path.as_ref() == Some(&PathBuf::from(crate::OPREF_GET)) {
-            let get = map.next_value::<(Subject, Scalar)>(()).await?;
-            OpRef::Get(get)
-        } else if path.as_ref() == Some(&PathBuf::from(crate::OPREF_PUT)) {
-            let put = map.next_value::<(Subject, Scalar, Scalar)>(()).await?;
-            OpRef::Put(put)
-        } else if path.as_ref() == Some(&PathBuf::from(crate::OPREF_POST)) {
-            let post = map.next_value::<(Subject, Map<Scalar>)>(()).await?;
-            OpRef::Post(post)
-        } else if path.as_ref() == Some(&PathBuf::from(crate::OPREF_DELETE)) {
-            let delete = map.next_value::<(Subject, Scalar)>(()).await?;
-            OpRef::Delete(delete)
-        } else {
-            let subject = crate::scalar::subject_from_str(&key)
-                .map_err(|err| de::Error::custom(err.to_string()))?;
-
-            let args = map.next_value::<OpArgs>(()).await?;
-            match args {
-                OpArgs::Map(params) => OpRef::Post((subject, params)),
-                OpArgs::Seq(items) => match items.as_slice() {
-                    [key] => OpRef::Get((subject, key.clone())),
-                    [key, value] => OpRef::Put((subject, key.clone(), value.clone())),
-                    _ => {
-                        return Err(de::Error::custom(
-                            "invalid OpRef params (expected 1 or 2 elements)",
-                        ));
-                    }
-                },
-            }
-        }
-    } else {
-        let subject = crate::scalar::subject_from_str(&key)
-            .map_err(|err| de::Error::custom(err.to_string()))?;
-
-        let args = map.next_value::<OpArgs>(()).await?;
-        match args {
-            OpArgs::Map(params) => OpRef::Post((subject, params)),
-            OpArgs::Seq(items) => match items.as_slice() {
-                [key] => OpRef::Get((subject, key.clone())),
-                [key, value] => OpRef::Put((subject, key.clone(), value.clone())),
-                _ => {
-                    return Err(de::Error::custom(
-                        "invalid OpRef params (expected 1 or 2 elements)",
-                    ));
-                }
-            },
-        }
-    };
-
-    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-        let _ = map.next_value::<de::IgnoredAny>(()).await?;
-    }
-
-    Ok(op)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{IdRef, TCRef};
-    use bytes::Bytes;
-    use futures::{future, stream};
-
-    fn id(name: &str) -> Id {
-        name.parse().expect("Id")
-    }
-
-    fn reference(name: &str) -> Scalar {
-        Scalar::from(TCRef::Id(name.parse::<IdRef>().expect("IdRef")))
-    }
-
-    #[test]
-    fn requires_reports_only_unbound_lexical_ids() {
-        let op = OpDef::Get((
-            id("key"),
-            vec![
-                (id("local"), reference("$input")),
-                (id("result"), reference("$local")),
-            ],
-        ));
-        let mut required = BTreeSet::new();
-        op.requires(&mut required);
-
-        assert_eq!(required, BTreeSet::from([id("input")]));
-    }
-
-    #[test]
-    fn validation_enforces_single_assignment() {
-        assert!(OpDef::Post(Vec::new()).validate().is_err());
-
-        let duplicate = OpDef::Post(vec![
-            (id("result"), Scalar::from(1_u64)),
-            (id("result"), Scalar::from(2_u64)),
-        ]);
-        assert!(duplicate.validate().is_err());
-
-        let shadows_parameter = OpDef::Get((id("key"), vec![(id("key"), Scalar::from(1_u64))]));
-        assert!(shadows_parameter.validate().is_err());
-
-        let duplicate_parameters = OpDef::Put((
-            id("value"),
-            id("value"),
-            vec![(id("result"), Scalar::default())],
-        ));
-        assert!(duplicate_parameters.validate().is_err());
-
-        let reserved = OpDef::Post(vec![(id("self"), Scalar::from(1_u64))]);
-        assert!(reserved.validate().is_err());
-    }
-
-    #[test]
-    fn validation_rejects_nested_shadowing_and_control_collisions() {
-        let nested_shadow = OpDef::Post(vec![
-            (id("outer"), Scalar::from(1_u64)),
-            (
-                id("result"),
-                Scalar::Op(OpDef::Post(vec![(id("outer"), Scalar::from(2_u64))])),
-            ),
-        ]);
-        assert!(nested_shadow.validate().is_err());
-
-        let foreach_shadow = OpDef::Post(vec![
-            (id("item"), Scalar::from(1_u64)),
-            (
-                id("result"),
-                Scalar::from(TCRef::ForEach(Box::new(crate::ForEach::new(
-                    Scalar::Tuple(Vec::new()),
-                    Scalar::Op(OpDef::Post(vec![(id("each"), reference("$item"))])),
-                    id("item"),
-                )))),
-            ),
-        ]);
-        assert!(foreach_shadow.validate().is_err());
-
-        let while_shadow = OpDef::Post(vec![
-            (id("state"), Scalar::from(1_u64)),
-            (
-                id("result"),
-                Scalar::from(TCRef::While(Box::new(crate::While::new(
-                    Scalar::Op(OpDef::Post(vec![(id("condition"), Scalar::from(1_u64))])),
-                    Scalar::Op(OpDef::Post(vec![(id("next"), Scalar::from(0_u64))])),
-                    Scalar::from(0_u64),
-                )))),
-            ),
-        ]);
-        assert!(while_shadow.validate().is_err());
-    }
-
-    #[test]
-    fn sibling_scopes_may_reuse_private_names() {
-        let branch = || Scalar::Op(OpDef::Post(vec![(id("private"), Scalar::from(1_u64))]));
-        let op = OpDef::Post(vec![(
-            id("result"),
-            Scalar::Tuple(vec![branch(), branch()]),
-        )]);
-
-        op.validate().expect("disjoint sibling scopes");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decoding_rejects_duplicate_bindings() {
-        let duplicate = OpDef::Post(vec![
-            (id("result"), Scalar::from(1_u64)),
-            (id("result"), Scalar::from(2_u64)),
-        ]);
-        let encoded = destream_json::encode(duplicate).expect("encode invalid OpDef");
-        let decoded: Result<OpDef, _> = destream_json::try_decode((), encoded).await;
-        let error = decoded.expect_err("reject duplicate binding");
-
-        assert!(error.to_string().contains("duplicate OpDef binding"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decoding_rejects_an_empty_operation() {
-        let encoded = destream_json::encode(OpDef::Post(Vec::new())).expect("encode empty OpDef");
-        let decoded: Result<OpDef, _> = destream_json::try_decode((), encoded).await;
-        let error = decoded.expect_err("reject empty operation");
-
-        assert!(error.to_string().contains("at least one provider"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn shared_lexical_fixtures_enforce_the_contract() {
-        for fixture in [
-            include_str!("../fixtures/lexical/valid-forward.json"),
-            include_str!("../fixtures/lexical/valid-capture.json"),
-        ] {
-            let source = stream::once(future::ready(Ok::<_, std::convert::Infallible>(
-                Bytes::copy_from_slice(fixture.as_bytes()),
-            )));
-            let op: OpDef = destream_json::try_decode((), source)
-                .await
-                .expect("valid lexical fixture");
-            op.validate().expect("valid lexical scope");
-        }
-
-        for fixture in [
-            include_str!("../fixtures/lexical/invalid-shadow.json"),
-            include_str!("../fixtures/lexical/invalid-foreach.json"),
-            include_str!("../fixtures/lexical/invalid-while.json"),
-        ] {
-            let source = stream::once(future::ready(Ok::<_, std::convert::Infallible>(
-                Bytes::copy_from_slice(fixture.as_bytes()),
-            )));
-            let decoded: Result<OpDef, _> = destream_json::try_decode((), source).await;
-            decoded.expect_err("invalid lexical fixture");
-        }
-    }
-}
+#[path = "../tests/unit/op.rs"]
+mod tests;
