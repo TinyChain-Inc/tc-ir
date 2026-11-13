@@ -45,6 +45,40 @@ impl get_size::GetSize for Scalar {
 }
 
 impl Scalar {
+    /// Whether this scalar can become a Value within the remaining tuple depth.
+    /// Maps, references, and operations are not Values. Embedded Value tuples
+    /// share the allowance, which is capped at Value's native nesting limit.
+    pub fn within_value_depth(&self, remaining: usize) -> bool {
+        let remaining = remaining.min(tc_value::MAX_VALUE_DEPTH);
+        if let Self::Value(value) = self {
+            return value.within_depth(remaining);
+        }
+
+        let mut pending = vec![std::slice::from_ref(self).iter()];
+        while let Some(items) = pending.last_mut() {
+            match items.next() {
+                Some(Self::Value(value)) => {
+                    if !value.within_depth(remaining - (pending.len() - 1)) {
+                        return false;
+                    }
+                }
+                Some(Self::Tuple(items)) => {
+                    if pending.len() > remaining {
+                        return false;
+                    }
+
+                    pending.push(items.iter());
+                }
+                Some(_) => return false,
+                None => {
+                    pending.pop();
+                }
+            }
+        }
+
+        true
+    }
+
     /// Whether this value contains an expression requiring evaluation.
     /// Operation definitions are literal closures, not evaluated expressions.
     pub fn is_ref(&self) -> bool {
@@ -286,7 +320,9 @@ impl fmt::Display for Subject {
         match self {
             Subject::Link(link) => fmt::Display::fmt(link, f),
             Subject::Ref(id, path) if path.is_empty() => fmt::Display::fmt(id, f),
-            Subject::Ref(id, path) => write!(f, "{id}{path}"),
+            Subject::Ref(id, path) => {
+                write!(f, "{id}{path}")
+            }
         }
     }
 }
@@ -333,8 +369,9 @@ pub(crate) fn subject_from_str(s: &str) -> Result<Subject, TCError> {
         if let Some(i) = s.find('/') {
             let id = &s[..i];
             let path_str = &s[i..];
-            let path =
-                PathBuf::from_str(path_str).map_err(|err| TCError::bad_request(err.to_string()))?;
+            let path = path_str
+                .parse::<PathBuf>()
+                .map_err(|err| TCError::bad_request(err.to_string()))?;
             let id_ref =
                 IdRef::from_str(id).map_err(|err| TCError::bad_request(err.to_string()))?;
             Ok(Subject::Ref(id_ref, path))
@@ -379,27 +416,7 @@ impl From<u64> for Scalar {
 
 impl safecast::TryCastFrom<Scalar> for Value {
     fn can_cast_from(scalar: &Scalar) -> bool {
-        let mut pending = vec![std::slice::from_ref(scalar).iter()];
-        while let Some(items) = pending.last_mut() {
-            match items.next() {
-                Some(Scalar::Value(value)) => {
-                    if !value.within_depth(tc_value::MAX_VALUE_DEPTH - (pending.len() - 1)) {
-                        return false;
-                    }
-                }
-                Some(Scalar::Tuple(items)) => {
-                    if pending.len() > tc_value::MAX_VALUE_DEPTH {
-                        return false;
-                    }
-                    pending.push(items.iter());
-                }
-                Some(_) => return false,
-                None => {
-                    pending.pop();
-                }
-            }
-        }
-        true
+        scalar.within_value_depth(tc_value::MAX_VALUE_DEPTH)
     }
 
     fn opt_cast_from(scalar: Scalar) -> Option<Self> {

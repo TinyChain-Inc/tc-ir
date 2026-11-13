@@ -216,6 +216,21 @@ async fn scalar_map_roundtrip() {
         .expect("decode scalar map");
 
     assert_eq!(decoded, scalar);
+
+    for name in ["ordinary", "100%", "literal%2Fname", "雪", "http"] {
+        let scalar = Scalar::Map(Map::from_iter([(
+            name.parse().unwrap(),
+            Scalar::from(7_u64),
+        )]));
+
+        assert_borrowed(&scalar).await;
+        let encoded = destream_json::encode(scalar.clone()).unwrap();
+        let decoded: Scalar = destream_json::try_decode((), encoded).await.unwrap();
+        assert_eq!(decoded, scalar);
+        let encoded = tbon::en::encode(&scalar).unwrap();
+        let decoded: Scalar = tbon::de::try_decode((), encoded).await.unwrap();
+        assert_eq!(decoded, scalar);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -229,6 +244,16 @@ async fn scalar_maps_reject_duplicate_input_names() {
     let decoded: Result<Scalar, _> = destream_json::try_decode((), source).await;
     let error = decoded.expect_err("reject duplicate input name");
     assert!(error.to_string().contains("duplicate map key input"));
+
+    for key in ["", "$", "$bad name", "/bad%escape", "http://", "bad name"] {
+        let input = BTreeMap::from([(key.to_owned(), Vec::<u64>::new())]);
+        let encoded = destream_json::encode(input.clone()).unwrap();
+        let decoded: Result<Scalar, _> = destream_json::try_decode((), encoded).await;
+        assert!(decoded.is_err(), "accepted invalid key {key:?}");
+        let encoded = tbon::en::encode(input).unwrap();
+        let decoded: Result<Scalar, _> = tbon::de::try_decode((), encoded).await;
+        assert!(decoded.is_err(), "accepted invalid key {key:?}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -246,17 +271,37 @@ async fn scalar_tuple_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scalar_opref_decodes_as_ref() {
-    let link = Link::from_str("/lib/acme/foo/1.0.0").expect("link");
-    let op = OpRef::Get((Subject::Link(link), Scalar::default()));
-    let scalar = Scalar::from(TCRef::Op(op));
+    let path = PathBuf::from(pathlink::path_label(&["lib", "acme", "foo", "1.0.0"]));
+    let remote = Link::new("http://127.0.0.1:8702".parse().unwrap(), path.clone());
+    for link in [Link::from(path), remote] {
+        let subject = Subject::Link(link.clone());
+        let calls = [
+            OpRef::Get((subject.clone(), Scalar::default())),
+            OpRef::Put((subject.clone(), Scalar::default(), Scalar::from(7_u64))),
+            OpRef::Post((
+                subject.clone(),
+                Map::from_iter([("value".parse().unwrap(), Scalar::from(7_u64))]),
+            )),
+            OpRef::Delete((subject, Scalar::default())),
+        ];
+        let values = std::iter::once(Scalar::from(Value::from(link)))
+            .chain(calls.into_iter().map(TCRef::Op).map(Scalar::from));
 
-    assert_borrowed(&scalar).await;
-    let encoded = destream_json::encode(scalar.clone()).expect("encode scalar ref");
-    let decoded: Scalar = destream_json::try_decode((), encoded)
-        .await
-        .expect("decode scalar ref");
+        for scalar in values {
+            assert_borrowed(&scalar).await;
+            let encoded = destream_json::encode(scalar.clone()).expect("encode scalar subject");
+            let decoded: Scalar = destream_json::try_decode((), encoded)
+                .await
+                .expect("decode scalar subject");
+            assert_eq!(decoded, scalar);
 
-    assert_eq!(decoded, scalar);
+            let encoded = tbon::en::encode(&scalar).expect("encode borrowed scalar subject");
+            let decoded: Scalar = tbon::de::try_decode((), encoded)
+                .await
+                .expect("decode borrowed scalar subject");
+            assert_eq!(decoded, scalar);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -385,4 +430,40 @@ fn map_require() {
 
     let err = map.require("answer").unwrap_err();
     assert!(err.message().contains("missing answer parameter"));
+}
+
+#[test]
+fn symbolic_subject_suffixes_are_not_uri_escapes() {
+    for name in ["λ", "literal%name", "%2f"] {
+        let subject = crate::Subject::Ref(
+            "$receiver".parse().unwrap(),
+            pathlink::PathBuf::from(name.parse::<crate::Id>().unwrap()),
+        );
+        let encoded = subject.to_string();
+        let decoded = crate::scalar::subject_from_str(&encoded).unwrap();
+        assert_eq!(decoded, subject);
+        assert!(encoded.ends_with(name));
+    }
+}
+
+#[tokio::test]
+async fn literal_paths_and_uri_links_keep_distinct_codec_meanings() {
+    for name in ["λ", "literal%name", "%2f", "%", "release+build"] {
+        let path = PathBuf::from(name.parse::<Id>().unwrap());
+        let text = format!("/{name}");
+        let encoded = destream_json::encode(path.clone()).unwrap();
+        let decoded: String = destream_json::try_decode((), encoded).await.unwrap();
+        assert_eq!(decoded, text);
+        let encoded = tbon::en::encode(&path).unwrap();
+        let decoded: PathBuf = tbon::de::try_decode((), encoded).await.unwrap();
+        assert_eq!(decoded, path);
+        let link = Link::from(path);
+        let encoded = tbon::en::encode(&link).unwrap();
+        let decoded: String = tbon::de::try_decode((), encoded).await.unwrap();
+        assert_eq!(decoded, link.to_string());
+        let map = BTreeMap::from([(name.parse::<Id>().unwrap(), 7u64)]);
+        let encoded = destream_json::encode(map).unwrap();
+        let decoded: BTreeMap<Id, u64> = destream_json::try_decode((), encoded).await.unwrap();
+        assert_eq!(decoded.keys().next().unwrap().as_str(), name);
+    }
 }

@@ -111,21 +111,25 @@ async fn scalar_items<D: de::Decoder>(
 async fn scalar_map<D: de::Decoder>(
     decoder: &mut D,
     mut map: de::Container,
-    mut key: Option<String>,
+    mut key: Option<Id>,
     remaining: usize,
     unique: bool,
 ) -> Result<Map<Scalar>, D::Error> {
     let mut values = Map::new();
     while map.slot() != de::Slot::End {
-        let name = match key.take() {
-            Some(key) => key,
-            None => first_key(decoder, &mut map).await?,
+        let id = match key.take() {
+            Some(id) => id,
+            None => first_key(decoder, &mut map)
+                .await?
+                .parse()
+                .map_err(de::Error::custom)?,
         };
+
         let value = Box::pin(decode_scalar(decoder, remaining)).await?;
-        let id = name.parse::<Id>().map_err(de::Error::custom)?;
         if values.insert(id.clone(), value).is_some() && unique {
             return Err(de::Error::custom(format!("duplicate map key {id}")));
         }
+
         decoder.finish_child(&mut map).await?;
     }
 
@@ -217,10 +221,12 @@ pub async fn decode_scalar<D: de::Decoder>(
                 return Ok(Scalar::Map(Map::new()));
             }
             let key = first_key(decoder, &mut map).await?;
-            if !key.starts_with('/') && !key.starts_with('$') {
+            // Ordinary maps have identifier keys; tags and subjects use their
+            // own parsers below. Reuse the parsed identifier in the map.
+            if let Ok(id) = key.parse::<Id>() {
                 let remaining = descend::<D::Error>(remaining, 1)?;
                 return Ok(Scalar::Map(
-                    Box::pin(scalar_map(decoder, map, Some(key), remaining, true)).await?,
+                    Box::pin(scalar_map(decoder, map, Some(id), remaining, true)).await?,
                 ));
             }
 

@@ -440,6 +440,7 @@ fn value_conversion_checks_combined_tuple_depth_before_construction() {
         for _ in 0..value_depth {
             value = Value::Tuple(vec![value]);
         }
+
         let mut scalar = Scalar::from(value);
         for _ in 0..scalar_depth {
             scalar = Scalar::Tuple(vec![scalar]);
@@ -450,6 +451,10 @@ fn value_conversion_checks_combined_tuple_depth_before_construction() {
             accepted,
             "Scalar depth {scalar_depth}, Value depth {value_depth}"
         );
+
+        assert_eq!(scalar.within_value_depth(MAX_VALUE_DEPTH), accepted);
+        assert_eq!(scalar.within_value_depth(usize::MAX), accepted);
+        assert!(!scalar.within_value_depth(0));
         let value = Value::opt_cast_from(scalar);
         assert_eq!(value.is_some(), accepted);
         if let Some(value) = value {
@@ -458,10 +463,15 @@ fn value_conversion_checks_combined_tuple_depth_before_construction() {
         }
     }
 
+    assert!(Scalar::from(7_u64).within_value_depth(0));
+    assert!(!Scalar::Tuple(Vec::new()).within_value_depth(0));
+    assert!(Scalar::Tuple(Vec::new()).within_value_depth(1));
+
     let mut empty = Scalar::Tuple(Vec::new());
     for _ in 1..MAX_VALUE_DEPTH {
         empty = Scalar::Tuple(vec![empty]);
     }
+
     assert!(Value::can_cast_from(&empty));
     assert!(Value::opt_cast_from(Scalar::Tuple(vec![empty])).is_none());
 }

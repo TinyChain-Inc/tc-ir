@@ -26,6 +26,10 @@ consume structural depth. Trusted native constructors and runtime composition
 must respect this contract; codec validation alone does not bound program-generated
 nesting. Execution and streaming traversal retain their separate stack-safety mechanisms.
 
+URI-valued subjects use canonical segment escaping. Symbolic references keep
+identifier text in their receiver and member suffixes; they are not decoded or
+formatted as URI escapes.
+
 Maps and tuples compose these forms recursively. Control flow is expressed by
 ordinary `TCRef` variants; no adapter or application-specific scalar variant is
 permitted.
@@ -48,6 +52,12 @@ transform operation arguments in the IR owner without execution or serialization
 The application owner chooses the binding appropriate to replication or composition.
 `Scalar::is_ref` distinguishes expressions from literal scalars and operation
 definitions, including expressions nested inside maps and tuples.
+
+`Scalar::within_value_depth` checks eligibility for Value conversion with a
+remaining tuple allowance capped at `MAX_VALUE_DEPTH`. Scalar tuples and embedded
+Value tuples share that allowance; maps, references, and operations are rejected.
+`TryCastFrom<Scalar> for Value` checks the complete shape before constructing the
+converted tuple containers. Enclosing State conversions reuse this check.
 
 ## Lexical scope
 
@@ -160,8 +170,9 @@ IR decoding delegates to concrete typed functions over shallow containers. A
 remaining-depth allowance bounds recursive polling before entering each native
 structure; siblings and wire envelopes do not consume it. Recursive future edges
 are boxed for finite future sizes, not as a substitute for the depth limit.
-Encoding retains its owned or borrowing event stream; framing and leaf parsing
-remain with `destream`.
+Encoding delegates each variant directly to typed codec APIs. Fixed fields use
+ordinary tuples and tagged maps; variable-length containers consume native
+iterators lazily through sequence/map streams. Framing remains with `destream`.
 
 Every `FromStream` implementation accepts the form emitted by its `IntoStream`
 implementation. Encoding must not implement equality, hashing, cloning,
