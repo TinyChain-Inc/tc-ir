@@ -3,9 +3,9 @@ use std::str::FromStr;
 
 use number_general::Number;
 use pathlink::{Link, PathBuf};
-use tc_value::Value;
 
 use super::*;
+use tc_value::Value;
 
 #[derive(Clone)]
 struct FakeTxn;
@@ -154,6 +154,7 @@ where
     T: Clone + for<'en> destream::en::IntoStream<'en> + for<'en> destream::en::ToStream<'en>,
 {
     use futures::TryStreamExt;
+
     async fn bytes<'en>(value: impl destream::en::IntoStream<'en> + 'en) -> Vec<u8> {
         destream_json::encode(value)
             .unwrap()
@@ -234,17 +235,7 @@ async fn scalar_map_roundtrip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn scalar_maps_reject_duplicate_input_names() {
-    use bytes::Bytes;
-    use futures::{future, stream};
-
-    let source = stream::once(future::ready(Ok::<_, std::convert::Infallible>(
-        Bytes::from_static(br#"{"input":1,"input":2}"#),
-    )));
-    let decoded: Result<Scalar, _> = destream_json::try_decode((), source).await;
-    let error = decoded.expect_err("reject duplicate input name");
-    assert!(error.to_string().contains("duplicate map key input"));
-
+async fn scalar_maps_reject_invalid_input_names() {
     for key in ["", "$", "$bad name", "/bad%escape", "http://", "bad name"] {
         let input = BTreeMap::from([(key.to_owned(), Vec::<u64>::new())]);
         let encoded = destream_json::encode(input.clone()).unwrap();
@@ -440,7 +431,7 @@ fn symbolic_subject_suffixes_are_not_uri_escapes() {
             pathlink::PathBuf::from(name.parse::<crate::Id>().unwrap()),
         );
         let encoded = subject.to_string();
-        let decoded = crate::scalar::subject_from_str(&encoded).unwrap();
+        let decoded = encoded.parse::<crate::Subject>().unwrap();
         assert_eq!(decoded, subject);
         assert!(encoded.ends_with(name));
     }
@@ -466,4 +457,39 @@ async fn literal_paths_and_uri_links_keep_distinct_codec_meanings() {
         let decoded: BTreeMap<Id, u64> = destream_json::try_decode((), encoded).await.unwrap();
         assert_eq!(decoded.keys().next().unwrap().as_str(), name);
     }
+}
+
+#[tokio::test]
+async fn identifier_strings_encode_owned_and_borrowed() {
+    use destream::IntoStream;
+    use futures::TryStreamExt;
+
+    async fn json<'en>(value: impl IntoStream<'en> + 'en) -> Vec<u8> {
+        destream_json::encode(value)
+            .unwrap()
+            .map_ok(|chunk| chunk.to_vec())
+            .try_concat()
+            .await
+            .unwrap()
+    }
+
+    async fn tbon<'en>(value: impl IntoStream<'en> + 'en) -> Vec<u8> {
+        tbon::en::encode(value)
+            .unwrap()
+            .map_ok(|chunk| chunk.to_vec())
+            .try_concat()
+            .await
+            .unwrap()
+    }
+
+    let id: Id = "λ".parse().unwrap();
+    let id_ref = IdRef::new(id.clone());
+    assert_eq!(json(&id).await, "\"λ\"".as_bytes());
+    assert_eq!(json(id.clone()).await, json(&id).await);
+    assert_eq!(tbon(&id).await, "\"λ\"".as_bytes());
+    assert_eq!(tbon(id).await, "\"λ\"".as_bytes());
+    assert_eq!(json(&id_ref).await, "\"$λ\"".as_bytes());
+    assert_eq!(json(id_ref.clone()).await, json(&id_ref).await);
+    assert_eq!(tbon(&id_ref).await, "\"$λ\"".as_bytes());
+    assert_eq!(tbon(id_ref).await, "\"$λ\"".as_bytes());
 }

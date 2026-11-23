@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
-use std::{fmt, str::FromStr};
+use std::fmt;
+use std::str::FromStr;
 
 use async_hash::{Digest, Hash, Output};
 use destream::{de, en};
@@ -45,6 +46,26 @@ impl get_size::GetSize for Scalar {
 }
 
 impl Scalar {
+    /// Check native composition against the codec's shared structural allowance.
+    /// This is independent of lexical validation and does not encode the value.
+    pub fn within_depth(&self, remaining: usize) -> bool {
+        match self {
+            Self::Value(value) => value.within_depth(remaining),
+            Self::Tuple(values) => remaining
+                .checked_sub(1)
+                .is_some_and(|n| values.iter().all(|v| v.within_depth(n))),
+            Self::Map(values) => remaining
+                .checked_sub(1)
+                .is_some_and(|n| values.values().all(|v| v.within_depth(n))),
+            Self::Op(op) => remaining
+                .checked_sub(2)
+                .is_some_and(|n| op.form().iter().all(|(_, v)| v.within_depth(n))),
+            Self::Ref(value) => remaining
+                .checked_sub(1)
+                .is_some_and(|n| value.within_depth(n)),
+        }
+    }
+
     /// Whether this scalar can become a Value within the remaining tuple depth.
     /// Maps, references, and operations are not Values. Embedded Value tuples
     /// share the allowance, which is capped at Value's native nesting limit.
@@ -299,13 +320,13 @@ impl de::FromStream for IdRef {
 
 impl<'en> en::IntoStream<'en> for IdRef {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        encoder.encode_str(&self.to_string())
+        encoder.collect_str(&self)
     }
 }
 
 impl<'en> en::ToStream<'en> for IdRef {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        encoder.encode_str(&self.to_string())
+        encoder.collect_str(self)
     }
 }
 
@@ -348,39 +369,47 @@ impl de::FromStream for Subject {
     ) -> Result<Self, D::Error> {
         let s = String::from_stream((), decoder).await?;
 
-        subject_from_str(&s).map_err(|err| de::Error::custom(err.to_string()))
+        s.parse().map_err(de::Error::custom)
     }
 }
 
 impl<'en> en::IntoStream<'en> for Subject {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.to_string().into_stream(encoder)
+        encoder.collect_str(&self)
     }
 }
 
 impl<'en> en::ToStream<'en> for Subject {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(self.to_string(), encoder)
+        encoder.collect_str(self)
     }
 }
 
-pub(crate) fn subject_from_str(s: &str) -> Result<Subject, TCError> {
-    if s.starts_with('$') {
-        if let Some(i) = s.find('/') {
-            let id = &s[..i];
-            let path_str = &s[i..];
-            let path = path_str
-                .parse::<PathBuf>()
-                .map_err(|err| TCError::bad_request(err.to_string()))?;
-            let id_ref =
-                IdRef::from_str(id).map_err(|err| TCError::bad_request(err.to_string()))?;
-            Ok(Subject::Ref(id_ref, path))
+impl FromStr for Subject {
+    type Err = TCError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.starts_with('$') {
+            if let Some(i) = s.find('/') {
+                let id = &s[..i];
+                let path_str = &s[i..];
+                let path = path_str
+                    .parse::<PathBuf>()
+                    .map_err(|err| TCError::bad_request(err.to_string()))?;
+
+                let id_ref =
+                    IdRef::from_str(id).map_err(|err| TCError::bad_request(err.to_string()))?;
+
+                Ok(Subject::Ref(id_ref, path))
+            } else {
+                let id_ref =
+                    IdRef::from_str(s).map_err(|err| TCError::bad_request(err.to_string()))?;
+
+                Ok(Subject::Ref(id_ref, PathBuf::default()))
+            }
         } else {
-            let id_ref = IdRef::from_str(s).map_err(|err| TCError::bad_request(err.to_string()))?;
-            Ok(Subject::Ref(id_ref, PathBuf::default()))
+            Link::from_str(s).map(Subject::Link).map_err(TCError::from)
         }
-    } else {
-        Link::from_str(s).map(Subject::Link).map_err(TCError::from)
     }
 }
 

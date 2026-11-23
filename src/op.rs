@@ -30,6 +30,10 @@ pub type DeleteRef = (Subject, Scalar);
 /// - PUT: `{ "<subject>": [<key>, <value>] }`
 /// - POST: `{ "<subject>": { "<name>": <value>, ... } }`
 /// - DELETE: `{ "/state/scalar/ref/op/delete": [<subject>, <key>] }`
+///
+/// Hostless `/state/...` subjects use the explicit reference tag for every
+/// verb, with the subject as the first payload field, to distinguish invocation
+/// from a typed State. POST's second field is its parameter map.
 #[derive(Clone, Debug, PartialEq)]
 pub enum OpRef {
     Get(GetRef),

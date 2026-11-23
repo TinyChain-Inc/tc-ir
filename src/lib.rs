@@ -21,7 +21,7 @@ mod map;
 pub use map::Map;
 
 mod codec;
-pub use codec::{decode_op_def_entry, decode_scalar};
+pub use codec::{decode_scalar, decode_scalar_entry};
 
 /// Maximum decoded structural nesting, shared with enclosing State decoders.
 ///
@@ -43,7 +43,6 @@ pub use tcref::*;
 #[cfg(test)]
 #[path = "../tests/unit/stack_tests.rs"]
 mod stack_tests;
-
 #[cfg(test)]
 #[path = "../tests/unit/tests.rs"]
 mod tests;
