@@ -356,7 +356,7 @@ impl<D: Digest> Hash<D> for &IdRef {
 
 impl<D: Digest> Hash<D> for &Subject {
     fn hash(self) -> Output<D> {
-        Hash::<D>::hash(self.to_string())
+        Hash::<D>::hash(format_args!("{self}"))
     }
 }
 
@@ -393,17 +393,13 @@ impl FromStr for Subject {
             if let Some(i) = s.find('/') {
                 let id = &s[..i];
                 let path_str = &s[i..];
-                let path = path_str
-                    .parse::<PathBuf>()
-                    .map_err(|err| TCError::bad_request(err.to_string()))?;
+                let path = path_str.parse::<PathBuf>().map_err(TCError::bad_request)?;
 
-                let id_ref =
-                    IdRef::from_str(id).map_err(|err| TCError::bad_request(err.to_string()))?;
+                let id_ref = IdRef::from_str(id).map_err(TCError::bad_request)?;
 
                 Ok(Subject::Ref(id_ref, path))
             } else {
-                let id_ref =
-                    IdRef::from_str(s).map_err(|err| TCError::bad_request(err.to_string()))?;
+                let id_ref = IdRef::from_str(s).map_err(TCError::bad_request)?;
 
                 Ok(Subject::Ref(id_ref, PathBuf::default()))
             }

@@ -49,8 +49,7 @@ async fn field<T: FromStream<Context = ()>, D: de::Decoder>(
     Ok(value)
 }
 
-// Box this helper at recursive callers: its delimiter future must not inflate
-// every enclosing reference frame. Keep the child Scalar future boxed as well.
+// The child Scalar box breaks recursive future sizing; callers await this helper directly.
 async fn scalar_field<D: de::Decoder>(
     decoder: &mut D,
     sequence: &mut de::Container,
@@ -322,22 +321,22 @@ async fn reference_payload<D: de::Decoder>(
         require_field::<D::Error>(&sequence, 0, 3)?;
         let cond = Box::pin(reference(decoder, remaining)).await?;
         decoder.finish_child(&mut sequence).await?;
-        let then = Box::pin(scalar_field(decoder, &mut sequence, remaining, 1, 3)).await?;
-        let or_else = Box::pin(scalar_field(decoder, &mut sequence, remaining, 2, 3)).await?;
+        let then = scalar_field(decoder, &mut sequence, remaining, 1, 3).await?;
+        let or_else = scalar_field(decoder, &mut sequence, remaining, 2, 3).await?;
         TCRef::Cond(Box::new(Cond::new(cond, then, or_else)))
     } else if path == &crate::TCREF_AFTER[..] {
-        let when = Box::pin(scalar_field(decoder, &mut sequence, remaining, 0, 2)).await?;
-        let then = Box::pin(scalar_field(decoder, &mut sequence, remaining, 1, 2)).await?;
+        let when = scalar_field(decoder, &mut sequence, remaining, 0, 2).await?;
+        let then = scalar_field(decoder, &mut sequence, remaining, 1, 2).await?;
         TCRef::After(Box::new(After::new(when, then)))
     } else if path == &crate::TCREF_WHILE[..] {
-        let cond = Box::pin(scalar_field(decoder, &mut sequence, remaining, 0, 3)).await?;
-        let closure = Box::pin(scalar_field(decoder, &mut sequence, remaining, 1, 3)).await?;
-        let state = Box::pin(scalar_field(decoder, &mut sequence, remaining, 2, 3)).await?;
+        let cond = scalar_field(decoder, &mut sequence, remaining, 0, 3).await?;
+        let closure = scalar_field(decoder, &mut sequence, remaining, 1, 3).await?;
+        let state = scalar_field(decoder, &mut sequence, remaining, 2, 3).await?;
         TCRef::While(Box::new(While::new(cond, closure, state)))
     } else {
-        let items = Box::pin(scalar_field(decoder, &mut sequence, remaining, 0, 3)).await?;
-        let op = Box::pin(scalar_field(decoder, &mut sequence, remaining, 1, 3)).await?;
-        let name = Box::pin(scalar_field(decoder, &mut sequence, remaining, 2, 3)).await?;
+        let items = scalar_field(decoder, &mut sequence, remaining, 0, 3).await?;
+        let op = scalar_field(decoder, &mut sequence, remaining, 1, 3).await?;
+        let name = scalar_field(decoder, &mut sequence, remaining, 2, 3).await?;
         end_fields::<D::Error>(&sequence)?;
         let name = match name {
             Scalar::Value(Value::String(name)) => name.parse().map_err(de::Error::custom)?,
@@ -371,9 +370,9 @@ async fn call_payload<D: de::Decoder>(
         decoder.finish_child(&mut sequence).await?;
         OpRef::Post((subject, params))
     } else {
-        let key = Box::pin(scalar_field(decoder, &mut sequence, remaining, 1, count)).await?;
+        let key = scalar_field(decoder, &mut sequence, remaining, 1, count).await?;
         if put {
-            let value = Box::pin(scalar_field(decoder, &mut sequence, remaining, 2, count)).await?;
+            let value = scalar_field(decoder, &mut sequence, remaining, 2, count).await?;
             OpRef::Put((subject, key, value))
         } else if path == &crate::OPREF_DELETE[..] {
             OpRef::Delete((subject, key))
@@ -395,7 +394,7 @@ async fn form<D: de::Decoder>(
     while sequence.slot() != de::Slot::End {
         let mut binding = decoder.open_container(de::Kind::Seq, None).await?;
         let id = field(decoder, &mut binding, 0, 2).await?;
-        let value = Box::pin(scalar_field(decoder, &mut binding, remaining, 1, 2)).await?;
+        let value = scalar_field(decoder, &mut binding, remaining, 1, 2).await?;
         if binding.slot() != de::Slot::End {
             return Err(de::Error::invalid_length(3, 2));
         }
