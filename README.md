@@ -43,9 +43,7 @@ cargo test --all-targets --all-features
 ```
 
 Changes to an IR form require symmetric codec tests. Changes to hashing require
-deterministic golden tests. See the [crate notes](AGENTS.md). The TinyChain
-[workspace architecture](https://github.com/TinyChain-Inc/tcv2/blob/main/ARCHITECTURE.md)
-is non-normative integration context.
+deterministic golden tests. See the [crate notes](AGENTS.md).
 
 Unit-test implementations live under `tests/unit/`, linked from their owning
 modules to preserve private access and test names. Shared test fixtures belong

@@ -15,9 +15,7 @@ hosts, and tooling consume. Keep it dependency-light and transport-neutral.
 ## Contribution workflow
 
 1. Read the repository-local [crate notes](AGENTS.md) and canonical
-   [IR interface guidelines](IR_INTERFACE_GUIDELINES.md). The TinyChain
-   [workspace contributor guide](https://github.com/TinyChain-Inc/tcv2/blob/main/CONTRIBUTING.md)
-   is non-normative integration context.
+   [IR interface guidelines](IR_INTERFACE_GUIDELINES.md).
 2. Keep formatting and linting clean: run `cargo fmt` and
    `cargo clippy --all-targets --all-features -- -D warnings` before sending
    patches.
