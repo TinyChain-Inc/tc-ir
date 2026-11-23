@@ -2,20 +2,23 @@ use destream::en::{self, EncodeMap, IntoStream, MapStream, SeqStream, ToStream};
 use futures::stream;
 
 use crate::{OpDef, OpRef, Scalar, TCRef};
+use tc_value::class::NativeClass;
+use tc_value::{Value, ValueType};
 
 fn tagged<'en, E: en::Encoder<'en>, T: IntoStream<'en> + 'en>(
     encoder: E,
-    key: impl ToString,
+    key: impl IntoStream<'en> + 'en,
     value: T,
 ) -> Result<E::Ok, E::Error> {
     let mut map = encoder.encode_map(Some(1))?;
-    map.encode_entry(key.to_string(), value)?;
+    map.encode_entry(key, value)?;
     map.end()
 }
 
 impl<'en> IntoStream<'en> for Scalar {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
+            Self::Value(value @ Value::Tuple(_)) => tagged(encoder, ValueType::Tuple.path(), value),
             Self::Value(value) => value.into_stream(encoder),
             Self::Ref(value) => (*value).into_stream(encoder),
             Self::Op(value) => value.into_stream(encoder),
@@ -28,6 +31,7 @@ impl<'en> IntoStream<'en> for Scalar {
 impl<'en> ToStream<'en> for Scalar {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
+            Self::Value(value @ Value::Tuple(_)) => tagged(encoder, ValueType::Tuple.path(), value),
             Self::Value(value) => value.to_stream(encoder),
             Self::Ref(value) => value.to_stream(encoder),
             Self::Op(value) => value.to_stream(encoder),
@@ -99,33 +103,40 @@ impl<'en> ToStream<'en> for TCRef {
     }
 }
 
+// Native type paths overlap constructor tags. Their calls use the existing
+// explicit OpRef representation; other subjects retain the concise form.
+macro_rules! encode_call {
+    ($value:expr, $encoder:expr) => {
+        match $value {
+            Self::Get((subject, key)) => {
+                if matches!(&subject, crate::Subject::Link(link) if link.host().is_none() && link.path().first().is_some_and(|id| id.as_str() == "state")) {
+                    tagged($encoder, crate::OPREF_GET, (subject, key))
+                } else { tagged($encoder, subject, (key,)) }
+            }
+            Self::Put((subject, key, value)) => {
+                if matches!(&subject, crate::Subject::Link(link) if link.host().is_none() && link.path().first().is_some_and(|id| id.as_str() == "state")) {
+                    tagged($encoder, crate::OPREF_PUT, (subject, key, value))
+                } else { tagged($encoder, subject, (key, value)) }
+            }
+            Self::Post((subject, params)) => {
+                if matches!(&subject, crate::Subject::Link(link) if link.host().is_none() && link.path().first().is_some_and(|id| id.as_str() == "state")) {
+                    tagged($encoder, crate::OPREF_POST, (subject, MapStream::from(stream::iter(params))))
+                } else { tagged($encoder, subject, MapStream::from(stream::iter(params))) }
+            }
+            Self::Delete((subject, key)) => tagged($encoder, crate::OPREF_DELETE, (subject, key)),
+        }
+    };
+}
+
 impl<'en> IntoStream<'en> for OpRef {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Self::Get((subject, key)) => tagged(encoder, subject, (key,)),
-            Self::Put((subject, key, value)) => tagged(encoder, subject, (key, value)),
-            Self::Post((subject, params)) => {
-                tagged(encoder, subject, MapStream::from(stream::iter(params)))
-            }
-            Self::Delete((subject, key)) => {
-                tagged(encoder, crate::OPREF_DELETE, (subject.to_string(), key))
-            }
-        }
+        encode_call!(self, encoder)
     }
 }
 
 impl<'en> ToStream<'en> for OpRef {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Self::Get((subject, key)) => tagged(encoder, subject, (key,)),
-            Self::Put((subject, key, value)) => tagged(encoder, subject, (key, value)),
-            Self::Post((subject, params)) => {
-                tagged(encoder, subject, MapStream::from(stream::iter(params)))
-            }
-            Self::Delete((subject, key)) => {
-                tagged(encoder, crate::OPREF_DELETE, (subject.to_string(), key))
-            }
-        }
+        encode_call!(self, encoder)
     }
 }
 

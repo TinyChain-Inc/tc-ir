@@ -161,6 +161,34 @@ Owned and borrowed streaming codecs use the same representation. Borrowed codecs
 traverse their semantic children without cloning the expression tree. Fixed
 argument sequences retain their explicit field order and cardinality.
 
+`Scalar::Value(Value::Tuple(..))` uses the existing explicit Value tuple tag;
+`Scalar::Tuple(..)` remains an ordinary sequence. Literal Value links encode as
+URI text, including links naming reserved semantic paths. A valid supported
+URI in a bare value string decodes as a Link; a String containing such text
+uses the explicit String tag. Typed strings and map keys do not infer Links.
+These representations preserve native variants through persistence. Completed
+decoded variable-length containers discard spare capacity once before publication.
+
+State recognizes its exact type paths before delegating scalar entries to IR.
+IR recognizes its exact value, operation-definition, and reference type paths
+before interpreting other subject entries as invocations. A malformed recognized
+type is an error, never a fallback invocation. Calls to hostless `/state/...`
+subjects use the existing explicit `/state/scalar/ref/op/{verb}` tags, whose
+payload includes the subject, to avoid ambiguity with typed states. Other GET,
+PUT, and POST calls retain the concise subject-keyed representation. Link-keyed
+empty maps are not literal Links; literal Links use URI text.
+
+Typed-value, operation-definition, reference, and invocation envelopes contain
+exactly one map entry. All readers reject additional entries, including directly
+typed readers and readers reached through Scalar or State. Value payloads
+delegate to `tc-value`'s codecs. Identifier-keyed data maps and POST parameter maps
+reject duplicate keys before decoding the second payload. Recognized tags never
+discard unwanted fields or reinterpret malformed payloads as invocations.
+
+Entry decoding parses a type path once within IR and passes the borrowed path to
+its owning payload codec. Structural depth allowances remain shared through that
+delegation; a typed entrypoint does not reset a nested payload's allowance.
+
 The algebra implements `async_hash::Hash` directly. Maps use deterministic key
 order and sequences preserve their semantic order. These are structural hashes
 of decoded forms, not application digest policy. Hashing must not depend on JSON

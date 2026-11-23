@@ -2,17 +2,23 @@ use std::sync::Arc;
 
 use async_hash::{Hash, Sha256};
 use bytes::Bytes;
-use futures::{stream, StreamExt, TryStreamExt};
+use destream::FromStream;
+use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use get_size::GetSize;
 use pathlink::{label, path_label, PathBuf, PathLabel};
 
 use crate::{Cond, Scalar, TCRef, MAX_SCALAR_DEPTH};
-use tc_value::{class::NativeClass, ValueType};
+use tc_value::class::NativeClass;
+use tc_value::ValueType;
 
 const RESOURCE_PATH: PathLabel = path_label(&["resource"]);
 const SERVICE_PATH: PathLabel = path_label(&["service", "test", "test", "1.0.0"]);
 
 async fn decode(binary: bool, input: Vec<u8>) -> Result<Scalar, String> {
+    decode_as(binary, input).await
+}
+
+async fn decode_as<T: FromStream<Context = ()>>(binary: bool, input: Vec<u8>) -> Result<T, String> {
     let source = stream::iter(input.chunks(17).map(Bytes::copy_from_slice));
     if binary {
         tbon::de::decode((), source)
@@ -121,8 +127,9 @@ async fn canonical_depth_and_lifecycle_use_the_worker_stack() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recursive_queries_use_the_worker_stack() {
     tokio::spawn(async {
-        use crate::{Id, IdRef, OpDef, OpRef, Subject, TCRef};
         use std::collections::BTreeSet;
+
+        use crate::{Id, IdRef, OpDef, OpRef, Subject, TCRef};
 
         let resource =
             pathlink::Link::from(pathlink::PathBuf::from(pathlink::path_label(&["test"])));
@@ -370,23 +377,6 @@ async fn operation_argument_maps_and_reference_tails_preserve_their_contracts() 
         assert_eq!(link.path(), &subject);
     }
 
-    let scalar = decode(false, br#"{"$f":{"x":1,"x":2}}"#.to_vec())
-        .await
-        .unwrap();
-    let Scalar::Ref(reference) = &scalar else {
-        panic!("call reference")
-    };
-    let TCRef::Op(crate::OpRef::Post((_, params))) = reference.as_ref() else {
-        panic!("POST arguments")
-    };
-    assert_eq!(params.get("x"), Some(&Scalar::from(2_u64)));
-
-    let wire = br#"{"$f":[null],"extra":17}"#;
-    let source = stream::iter([Bytes::copy_from_slice(wire)]);
-    let call: crate::OpRef = destream_json::decode((), source).await.unwrap();
-    assert!(matches!(call, crate::OpRef::Get(_)));
-    assert!(decode(false, wire.to_vec()).await.is_err());
-
     for (path, payload, expected) in [
         (crate::TCREF_AFTER, "[]", "length"),
         (crate::TCREF_AFTER, "[null,null,null]", "too many"),
@@ -400,7 +390,7 @@ async fn operation_argument_maps_and_reference_tails_preserve_their_contracts() 
         assert!(error.contains(expected), "{wire}: {error}");
     }
 
-    let resource = format!("{{\"{RESOURCE_PATH}\":[]}}");
+    let resource = format!("\"{RESOURCE_PATH}\"");
     for (payload, levels) in [
         ("null", 0),
         (resource.as_str(), 0),
@@ -423,9 +413,119 @@ async fn operation_argument_maps_and_reference_tails_preserve_their_contracts() 
     }
 }
 
+// These fixtures contain only strings, containers, and null.
+fn null_wire(binary: bool, json: &str) -> Vec<u8> {
+    if binary {
+        json.replace("\":", "\"")
+            .replace(',', "")
+            .replace("null", "\u{1}")
+            .into_bytes()
+    } else {
+        json.as_bytes().to_vec()
+    }
+}
+
+#[tokio::test]
+async fn typed_and_scalar_readers_require_singleton_records() {
+    for binary in [false, true] {
+        for json in [
+            r#"{"$f":[null]}"#.to_owned(),
+            r#"{"$f":[null,null]}"#.to_owned(),
+            r#"{"$f":{"key":null}}"#.to_owned(),
+            format!(r#"{{"{}":["$f",null]}}"#, crate::OPREF_GET),
+            format!(r#"{{"{}":["$f",null,null]}}"#, crate::OPREF_PUT),
+            format!(r#"{{"{}":["$f",{{"key":null}}]}}"#, crate::OPREF_POST),
+            format!(r#"{{"{}":["$f",null]}}"#, crate::OPREF_DELETE),
+        ] {
+            let bytes = null_wire(binary, &json);
+            assert!(decode_as::<crate::OpRef>(binary, bytes.clone())
+                .await
+                .is_ok());
+
+            assert!(decode_as::<TCRef>(binary, bytes.clone()).await.is_ok());
+            assert!(decode(binary, bytes).await.is_ok());
+            let extra = format!(r#"{},"extra":[]}}"#, &json[..json.len() - 1]);
+            let bytes = null_wire(binary, &extra);
+            assert!(decode_as::<crate::OpRef>(binary, bytes.clone())
+                .await
+                .is_err());
+
+            assert!(decode_as::<TCRef>(binary, bytes.clone()).await.is_err());
+            assert!(decode(binary, bytes).await.is_err());
+        }
+
+        let json = format!(r#"{{"{}":[null,null]}}"#, crate::TCREF_AFTER);
+        assert!(decode_as::<TCRef>(binary, null_wire(binary, &json))
+            .await
+            .is_ok());
+
+        let extra = format!(r#"{},"extra":[]}}"#, &json[..json.len() - 1]);
+        assert!(decode_as::<TCRef>(binary, null_wire(binary, &extra))
+            .await
+            .is_err());
+
+        assert!(decode(binary, null_wire(binary, &extra)).await.is_err());
+
+        let json = format!(r#"{{"{}":[["result",null]]}}"#, crate::OPDEF_POST);
+        assert!(decode_as::<crate::OpDef>(binary, null_wire(binary, &json))
+            .await
+            .is_ok());
+
+        assert!(decode(binary, null_wire(binary, &json)).await.is_ok());
+        let extra = format!(r#"{},"extra":[]}}"#, &json[..json.len() - 1]);
+        assert!(decode_as::<crate::OpDef>(binary, null_wire(binary, &extra))
+            .await
+            .is_err());
+
+        assert!(decode(binary, null_wire(binary, &extra)).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn duplicate_call_arguments_reject_before_the_second_payload() {
+    for binary in [false, true] {
+        for json in [
+            r#"{"x":null,"x":[]}"#.to_owned(),
+            r#"{"$f":{"x":null,"x":[]}}"#.to_owned(),
+            format!(r#"{{"{}":["$f",{{"x":null,"x":[]}}]}}"#, crate::OPREF_POST),
+        ] {
+            assert!(decode(binary, null_wire(binary, &json)).await.is_err());
+            let end = json.rfind("[]").unwrap() + 1;
+            let prefix = null_wire(binary, &json[..end]);
+            let owner = Arc::new(());
+            let released = Arc::downgrade(&owner);
+            let source = stream::iter([Bytes::from(prefix)])
+                .chain(stream::pending())
+                .inspect(move |_| {
+                    let _ = &owner;
+                });
+
+            let decode = async {
+                if binary {
+                    tbon::de::decode::<_, Scalar>((), source)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    destream_json::decode::<_, Scalar>((), source)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            };
+
+            assert!(decode
+                .now_or_never()
+                .expect("reject without reading duplicate payload")
+                .is_err());
+
+            assert!(released.upgrade().is_none());
+        }
+    }
+}
+
 #[test]
 fn value_conversion_checks_combined_tuple_depth_before_construction() {
     use safecast::TryCastFrom;
+
     use tc_value::{Value, MAX_VALUE_DEPTH};
 
     for (scalar_depth, value_depth, accepted) in [
@@ -564,6 +664,7 @@ async fn mixed_codec_nesting_uses_one_structural_allowance() {
 fn streamed_container_hashes_preserve_native_boundaries() {
     use crate::{Id, Map, OpDef};
     use tc_value::Value;
+
     for width in [0, 1, 4097] {
         let items: Vec<Scalar> = (0..width)
             .map(|i| Scalar::from(Value::from(i as u64)))
@@ -662,6 +763,10 @@ async fn recursive_forms_enforce_depth_before_descending() {
                 };
                 let result = decode(binary, bytes.clone()).await;
                 assert!(result.is_ok(), "{name}, binary={binary}: {result:?}");
+                let value = result.unwrap();
+                assert!(value.within_depth(MAX_SCALAR_DEPTH));
+                assert!(!value.within_depth(MAX_SCALAR_DEPTH - 1));
+                assert!(!Scalar::Tuple(vec![value]).within_depth(MAX_SCALAR_DEPTH));
                 let mut excessive = vec![b'['];
                 excessive.extend_from_slice(&bytes);
                 excessive.push(b']');

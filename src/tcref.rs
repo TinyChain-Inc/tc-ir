@@ -133,6 +133,33 @@ impl get_size::GetSize for TCRef {
 }
 
 impl TCRef {
+    pub(crate) fn within_depth(&self, remaining: usize) -> bool {
+        match self {
+            Self::Id(_) => true,
+            Self::Op(op) => remaining.checked_sub(2).is_some_and(|n| match op {
+                crate::OpRef::Get((_, key)) | crate::OpRef::Delete((_, key)) => key.within_depth(n),
+                crate::OpRef::Put((_, key, value)) => key.within_depth(n) && value.within_depth(n),
+                crate::OpRef::Post((_, values)) => values.values().all(|v| v.within_depth(n)),
+            }),
+            Self::After(value) => remaining
+                .checked_sub(1)
+                .is_some_and(|n| value.when.within_depth(n) && value.then.within_depth(n)),
+            Self::Cond(value) => remaining.checked_sub(1).is_some_and(|n| {
+                value.cond.within_depth(n)
+                    && value.then.within_depth(n)
+                    && value.or_else.within_depth(n)
+            }),
+            Self::While(value) => remaining.checked_sub(1).is_some_and(|n| {
+                value.cond.within_depth(n)
+                    && value.closure.within_depth(n)
+                    && value.state.within_depth(n)
+            }),
+            Self::ForEach(value) => remaining
+                .checked_sub(1)
+                .is_some_and(|n| value.items.within_depth(n) && value.op.within_depth(n)),
+        }
+    }
+
     pub fn requires(&self, required: &mut BTreeSet<Id>) {
         self.requires_in(&BTreeSet::new(), required)
     }

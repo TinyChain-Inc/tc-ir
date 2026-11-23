@@ -1,11 +1,11 @@
+use std::collections::btree_map::Entry;
 use std::str::FromStr;
 
 use destream::de::{self, FromStream};
-use pathlink::{Link, PathBuf};
+use pathlink::PathBuf;
 
-use crate::{
-    op::OpDefType, After, Cond, ForEach, Id, Map, OpDef, OpRef, Scalar, Subject, TCRef, While,
-};
+use crate::op::OpDefType;
+use crate::{After, Cond, ForEach, Id, Map, OpDef, OpRef, Scalar, Subject, TCRef, While};
 use tc_value::Value;
 
 fn descend<E: de::Error>(remaining: usize, levels: usize) -> Result<usize, E> {
@@ -49,8 +49,7 @@ async fn field<T: FromStream<Context = ()>, D: de::Decoder>(
     Ok(value)
 }
 
-// Box this helper at recursive callers: its delimiter future must not inflate
-// every enclosing reference frame. Keep the child Scalar future boxed as well.
+// The child Scalar box breaks recursive future sizing; callers await this helper directly.
 async fn scalar_field<D: de::Decoder>(
     decoder: &mut D,
     sequence: &mut de::Container,
@@ -76,17 +75,9 @@ async fn first_key<D: de::Decoder>(
     Ok(key)
 }
 
-async fn finish_map<D: de::Decoder>(
-    decoder: &mut D,
-    mut map: de::Container,
-    drain: bool,
-) -> Result<(), D::Error> {
-    while map.slot() != de::Slot::End {
-        if !drain {
-            return Err(de::Error::custom("unexpected extra reference map entry"));
-        }
-        de::IgnoredAny::from_stream((), decoder).await?;
-        decoder.finish_child(&mut map).await?;
+fn end_map<E: de::Error>(map: &de::Container) -> Result<(), E> {
+    if map.slot() != de::Slot::End {
+        return Err(E::custom("unexpected extra IR map entry"));
     }
 
     Ok(())
@@ -105,7 +96,7 @@ async fn scalar_items<D: de::Decoder>(
         decoder.finish_child(&mut sequence).await?;
     }
 
-    Ok(values)
+    Ok(values.into_boxed_slice().into_vec())
 }
 
 async fn scalar_map<D: de::Decoder>(
@@ -113,7 +104,6 @@ async fn scalar_map<D: de::Decoder>(
     mut map: de::Container,
     mut key: Option<Id>,
     remaining: usize,
-    unique: bool,
 ) -> Result<Map<Scalar>, D::Error> {
     let mut values = Map::new();
     while map.slot() != de::Slot::End {
@@ -125,40 +115,43 @@ async fn scalar_map<D: de::Decoder>(
                 .map_err(de::Error::custom)?,
         };
 
-        let value = Box::pin(decode_scalar(decoder, remaining)).await?;
-        if values.insert(id.clone(), value).is_some() && unique {
-            return Err(de::Error::custom(format!("duplicate map key {id}")));
-        }
+        let entry = match values.entry(id) {
+            Entry::Vacant(entry) => entry,
+            Entry::Occupied(entry) => {
+                return Err(de::Error::custom(format!(
+                    "duplicate map key {}",
+                    entry.key()
+                )));
+            }
+        };
 
+        let value = Box::pin(decode_scalar(decoder, remaining)).await?;
+        entry.insert(value);
         decoder.finish_child(&mut map).await?;
     }
 
     Ok(values)
 }
 
-// Subject syntax uses a sequence for GET/PUT and a map for POST. Empty
-// sequences can instead represent a literal Link or an Id reference.
-async fn args<D: de::Decoder>(
-    decoder: &mut D,
-    remaining: usize,
-    levels: usize,
-) -> Result<Scalar, D::Error> {
+// Subject syntax uses a sequence for GET/PUT and a map for POST.
+// Empty sequences represent an Id reference only; links use URI literals.
+async fn args<D: de::Decoder>(decoder: &mut D, remaining: usize) -> Result<Scalar, D::Error> {
     match decoder.peek_kind().await? {
         de::Kind::Seq => {
             let sequence = decoder.open_container(de::Kind::Seq, None).await?;
             if sequence.slot() == de::Slot::End {
                 return Ok(Scalar::Tuple(Vec::new()));
             }
-            let remaining = descend::<D::Error>(remaining, levels)?;
+            let remaining = descend::<D::Error>(remaining, 3)?;
             Ok(Scalar::Tuple(
                 scalar_items(decoder, sequence, remaining).await?,
             ))
         }
         de::Kind::Map => {
-            let remaining = descend::<D::Error>(remaining, levels)?;
+            let remaining = descend::<D::Error>(remaining, 3)?;
             let map = decoder.open_container(de::Kind::Map, None).await?;
             Ok(Scalar::Map(
-                scalar_map(decoder, map, None, remaining, false).await?,
+                scalar_map(decoder, map, None, remaining).await?,
             ))
         }
         _ => Err(de::Error::custom("invalid IR container shape")),
@@ -166,7 +159,7 @@ async fn args<D: de::Decoder>(
 }
 
 fn call<E: de::Error>(key: &str, args: Scalar) -> Result<OpRef, E> {
-    let subject = crate::scalar::subject_from_str(key).map_err(E::custom)?;
+    let subject = key.parse::<Subject>().map_err(E::custom)?;
     match args {
         Scalar::Map(params) => Ok(OpRef::Post((subject, params))),
         Scalar::Tuple(items) => {
@@ -226,117 +219,124 @@ pub async fn decode_scalar<D: de::Decoder>(
             if let Ok(id) = key.parse::<Id>() {
                 let remaining = descend::<D::Error>(remaining, 1)?;
                 return Ok(Scalar::Map(
-                    Box::pin(scalar_map(decoder, map, Some(id), remaining, true)).await?,
+                    Box::pin(scalar_map(decoder, map, Some(id), remaining)).await?,
                 ));
             }
 
-            Box::pin(tagged_scalar(decoder, map, key, remaining)).await
+            Box::pin(decode_scalar_entry(decoder, map, key, remaining)).await
         }
     }
 }
 
-// Keep tagged payload construction out of every ordinary container's polling
-// frame. Boxing recursive futures alone does not bound their polling stack.
-async fn tagged_scalar<D: de::Decoder>(
+/// Decode a scalar map entry after its owner consumed the first key and colon.
+/// Recognized type paths take precedence over invocation subjects. This consumes
+/// the payload and requires the map to end immediately afterward.
+pub async fn decode_scalar_entry<D: de::Decoder>(
     decoder: &mut D,
     mut map: de::Container,
     key: String,
     remaining: usize,
 ) -> Result<Scalar, D::Error> {
-    if let Some(value) = Box::pin(tc_value::decode_typed_value(
-        &key, decoder, &mut map, remaining,
-    ))
-    .await?
-    {
-        finish_map(decoder, map, true).await?;
+    let remaining = remaining.min(crate::MAX_SCALAR_DEPTH);
+    let value = Box::pin(entry_value(decoder, &mut map, &key, remaining)).await?;
+    end_map::<D::Error>(&map)?;
+    Ok(value)
+}
+
+async fn entry_value<D: de::Decoder>(
+    decoder: &mut D,
+    map: &mut de::Container,
+    key: &str,
+    remaining: usize,
+) -> Result<Scalar, D::Error> {
+    let path = PathBuf::from_str(key).ok();
+    let value = match &path {
+        Some(path) => Box::pin(tc_value::decode_typed_value(path, decoder, map, remaining)).await?,
+        None => None,
+    };
+
+    if let Some(value) = value {
         return Ok(value.into());
     }
 
-    let path = PathBuf::from_str(&key).ok();
     let value = if let Some(kind) = path.as_ref().and_then(OpDefType::from_path) {
         let remaining = descend::<D::Error>(remaining, 2)?;
         Scalar::Op(Box::pin(op_payload(decoder, kind, remaining)).await?)
-    } else if path.as_deref().is_some_and(reference_path) {
+    } else if let Some(path) = path.as_deref().filter(|path| reference_path(path)) {
         let remaining = descend::<D::Error>(remaining, 1)?;
-        Box::pin(reference_payload(decoder, &key, remaining))
+        Box::pin(reference_payload(decoder, path, remaining))
             .await?
             .into()
     } else {
-        match Box::pin(args(decoder, remaining, 3)).await? {
+        match Box::pin(args(decoder, remaining)).await? {
             Scalar::Tuple(items) if items.is_empty() => {
                 if key.starts_with('$') {
                     descend::<D::Error>(remaining, 1)?;
                     TCRef::Id(key.parse().map_err(de::Error::custom)?).into()
                 } else {
-                    Value::from(Link::from_str(&key).map_err(de::Error::custom)?).into()
+                    return Err(de::Error::custom("literal links must use URI text"));
                 }
             }
-            args => TCRef::Op(call::<D::Error>(&key, args)?).into(),
+            args => TCRef::Op(call::<D::Error>(key, args)?).into(),
         }
     };
 
-    decoder.finish_child(&mut map).await?;
-    finish_map(decoder, map, !key.starts_with('$')).await?;
+    decoder.finish_child(map).await?;
     Ok(value)
 }
 
 async fn reference<D: de::Decoder>(decoder: &mut D, remaining: usize) -> Result<TCRef, D::Error> {
     let mut map = decoder.open_container(de::Kind::Map, None).await?;
     let key = first_key(decoder, &mut map).await?;
-    let value = Box::pin(reference_payload(decoder, &key, remaining)).await?;
-    decoder.finish_child(&mut map).await?;
-    finish_map(decoder, map, !key.starts_with('$')).await?;
-    Ok(value)
+    // A directly typed reference already owns its outer envelope. Preserve its
+    // allowance while sharing Scalar's payload interpretation and precedence.
+    let value = Box::pin(entry_value(decoder, &mut map, &key, remaining + 1)).await?;
+    end_map::<D::Error>(&map)?;
+    match value {
+        Scalar::Ref(value) => Ok(*value),
+        _ => Err(de::Error::custom("expected a reference")),
+    }
 }
 
 async fn reference_payload<D: de::Decoder>(
     decoder: &mut D,
-    key: &str,
+    path: &[Id],
     remaining: usize,
 ) -> Result<TCRef, D::Error> {
-    let path = PathBuf::from_str(key).ok();
-    let path = path.as_deref().unwrap_or_default();
-    let control = path.len() == 4 && reference_path(path);
-    if !control {
-        if reference_path(path) {
-            return Ok(TCRef::Op(
-                Box::pin(call_payload(
-                    decoder,
-                    key,
-                    descend::<D::Error>(remaining, 1)?,
-                ))
-                .await?,
-            ));
-        }
-        return match Box::pin(args(decoder, remaining, 2)).await? {
-            Scalar::Tuple(items) if items.is_empty() && key.starts_with('$') => {
-                Ok(TCRef::Id(key.parse().map_err(de::Error::custom)?))
-            }
-            args => Ok(TCRef::Op(call::<D::Error>(key, args)?)),
-        };
+    // The entry decoder has already recognized this exact reference path.
+    if path.len() == 5 {
+        return Ok(TCRef::Op(
+            Box::pin(call_payload(
+                decoder,
+                path,
+                descend::<D::Error>(remaining, 1)?,
+            ))
+            .await?,
+        ));
     }
+
     let remaining = descend::<D::Error>(remaining, 1)?;
     let mut sequence = decoder.open_container(de::Kind::Seq, None).await?;
     let value = if path == &crate::TCREF_COND[..] {
         require_field::<D::Error>(&sequence, 0, 3)?;
         let cond = Box::pin(reference(decoder, remaining)).await?;
         decoder.finish_child(&mut sequence).await?;
-        let then = Box::pin(scalar_field(decoder, &mut sequence, remaining, 1, 3)).await?;
-        let or_else = Box::pin(scalar_field(decoder, &mut sequence, remaining, 2, 3)).await?;
+        let then = scalar_field(decoder, &mut sequence, remaining, 1, 3).await?;
+        let or_else = scalar_field(decoder, &mut sequence, remaining, 2, 3).await?;
         TCRef::Cond(Box::new(Cond::new(cond, then, or_else)))
     } else if path == &crate::TCREF_AFTER[..] {
-        let when = Box::pin(scalar_field(decoder, &mut sequence, remaining, 0, 2)).await?;
-        let then = Box::pin(scalar_field(decoder, &mut sequence, remaining, 1, 2)).await?;
+        let when = scalar_field(decoder, &mut sequence, remaining, 0, 2).await?;
+        let then = scalar_field(decoder, &mut sequence, remaining, 1, 2).await?;
         TCRef::After(Box::new(After::new(when, then)))
     } else if path == &crate::TCREF_WHILE[..] {
-        let cond = Box::pin(scalar_field(decoder, &mut sequence, remaining, 0, 3)).await?;
-        let closure = Box::pin(scalar_field(decoder, &mut sequence, remaining, 1, 3)).await?;
-        let state = Box::pin(scalar_field(decoder, &mut sequence, remaining, 2, 3)).await?;
+        let cond = scalar_field(decoder, &mut sequence, remaining, 0, 3).await?;
+        let closure = scalar_field(decoder, &mut sequence, remaining, 1, 3).await?;
+        let state = scalar_field(decoder, &mut sequence, remaining, 2, 3).await?;
         TCRef::While(Box::new(While::new(cond, closure, state)))
     } else {
-        let items = Box::pin(scalar_field(decoder, &mut sequence, remaining, 0, 3)).await?;
-        let op = Box::pin(scalar_field(decoder, &mut sequence, remaining, 1, 3)).await?;
-        let name = Box::pin(scalar_field(decoder, &mut sequence, remaining, 2, 3)).await?;
+        let items = scalar_field(decoder, &mut sequence, remaining, 0, 3).await?;
+        let op = scalar_field(decoder, &mut sequence, remaining, 1, 3).await?;
+        let name = scalar_field(decoder, &mut sequence, remaining, 2, 3).await?;
         end_fields::<D::Error>(&sequence)?;
         let name = match name {
             Scalar::Value(Value::String(name)) => name.parse().map_err(de::Error::custom)?,
@@ -355,16 +355,9 @@ async fn reference_payload<D: de::Decoder>(
 
 async fn call_payload<D: de::Decoder>(
     decoder: &mut D,
-    key: &str,
+    path: &[Id],
     remaining: usize,
 ) -> Result<OpRef, D::Error> {
-    let path = PathBuf::from_str(key).ok();
-    let path = path.as_deref().unwrap_or_default();
-    if path.len() != 5 || !reference_path(path) {
-        let args = Box::pin(args(decoder, remaining, 1)).await?;
-        descend::<D::Error>(remaining, 1)?;
-        return call::<D::Error>(key, args);
-    }
     let remaining = descend::<D::Error>(remaining, 1)?;
     let mut sequence = decoder.open_container(de::Kind::Seq, None).await?;
     let put = path == &crate::OPREF_PUT[..];
@@ -373,13 +366,13 @@ async fn call_payload<D: de::Decoder>(
     let value = if path == &crate::OPREF_POST[..] {
         require_field::<D::Error>(&sequence, 1, count)?;
         let map = decoder.open_container(de::Kind::Map, None).await?;
-        let params = Box::pin(scalar_map(decoder, map, None, remaining, true)).await?;
+        let params = Box::pin(scalar_map(decoder, map, None, remaining)).await?;
         decoder.finish_child(&mut sequence).await?;
         OpRef::Post((subject, params))
     } else {
-        let key = Box::pin(scalar_field(decoder, &mut sequence, remaining, 1, count)).await?;
+        let key = scalar_field(decoder, &mut sequence, remaining, 1, count).await?;
         if put {
-            let value = Box::pin(scalar_field(decoder, &mut sequence, remaining, 2, count)).await?;
+            let value = scalar_field(decoder, &mut sequence, remaining, 2, count).await?;
             OpRef::Put((subject, key, value))
         } else if path == &crate::OPREF_DELETE[..] {
             OpRef::Delete((subject, key))
@@ -401,7 +394,7 @@ async fn form<D: de::Decoder>(
     while sequence.slot() != de::Slot::End {
         let mut binding = decoder.open_container(de::Kind::Seq, None).await?;
         let id = field(decoder, &mut binding, 0, 2).await?;
-        let value = Box::pin(scalar_field(decoder, &mut binding, remaining, 1, 2)).await?;
+        let value = scalar_field(decoder, &mut binding, remaining, 1, 2).await?;
         if binding.slot() != de::Slot::End {
             return Err(de::Error::invalid_length(3, 2));
         }
@@ -410,7 +403,7 @@ async fn form<D: de::Decoder>(
         decoder.finish_child(&mut sequence).await?;
     }
 
-    Ok(values)
+    Ok(values.into_boxed_slice().into_vec())
 }
 
 async fn op_payload<D: de::Decoder>(
@@ -467,10 +460,23 @@ impl FromStream for OpRef {
     async fn from_stream<D: de::Decoder>((): (), decoder: &mut D) -> Result<Self, D::Error> {
         let mut map = decoder.open_container(de::Kind::Map, None).await?;
         let key = first_key(decoder, &mut map).await?;
-        let value = call_payload(decoder, &key, crate::MAX_SCALAR_DEPTH).await?;
-        decoder.finish_child(&mut map).await?;
-        finish_map(decoder, map, true).await?;
-        Ok(value)
+        // OpRef owns both the reference and call envelopes.
+        let value = Box::pin(entry_value(
+            decoder,
+            &mut map,
+            &key,
+            crate::MAX_SCALAR_DEPTH + 2,
+        ))
+        .await?;
+
+        end_map::<D::Error>(&map)?;
+        match value {
+            Scalar::Ref(value) => match *value {
+                TCRef::Op(value) => Ok(value),
+                _ => Err(de::Error::custom("expected an operation reference")),
+            },
+            _ => Err(de::Error::custom("expected an operation reference")),
+        }
     }
 }
 
@@ -492,24 +498,7 @@ impl FromStream for OpDef {
         )
         .await?;
         decoder.finish_child(&mut map).await?;
-        finish_map(decoder, map, true).await?;
+        end_map::<D::Error>(&map)?;
         Ok(value)
     }
-}
-
-/// Decode a tagged operation payload using its enclosing owner's depth allowance.
-/// Unknown paths leave the decoder untouched.
-pub async fn decode_op_def_entry<D: de::Decoder>(
-    path: &PathBuf,
-    decoder: &mut D,
-    map: &mut de::Container,
-    remaining: usize,
-) -> Result<Option<OpDef>, D::Error> {
-    let Some(kind) = OpDefType::from_path(path) else {
-        return Ok(None);
-    };
-    let remaining = descend::<D::Error>(remaining.min(crate::MAX_SCALAR_DEPTH), 1)?;
-    let op = op_payload(decoder, kind, remaining).await?;
-    decoder.finish_child(map).await?;
-    Ok(Some(op))
 }

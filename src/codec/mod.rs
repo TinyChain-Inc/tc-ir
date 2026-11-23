@@ -2,4 +2,4 @@
 mod decode;
 mod encode;
 
-pub use decode::{decode_op_def_entry, decode_scalar};
+pub use decode::{decode_scalar, decode_scalar_entry};

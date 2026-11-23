@@ -122,13 +122,17 @@ where
         path: &[PathSegment],
         key: Scalar,
     ) -> impl Future<Output = TCResult<State>> + Send + 'a {
-        let handler = self.route(path);
-        let path = path_string(path);
+        let handler = self
+            .route(path)
+            .ok_or_else(|| TCError::not_found(path_string(path)))
+            .and_then(|handler| {
+                handler
+                    .get()
+                    .ok_or_else(|| TCError::method_not_allowed(Method::Get, path_string(path)))
+            });
+
         async move {
-            let handler = handler.ok_or_else(|| TCError::not_found(path.clone()))?;
-            let handler = handler
-                .get()
-                .ok_or_else(|| TCError::method_not_allowed(Method::Get, path))?;
+            let handler = handler?;
             handler(txn, key).await
         }
     }
@@ -140,13 +144,17 @@ where
         key: Scalar,
         value: State,
     ) -> impl Future<Output = TCResult<()>> + Send + 'a {
-        let handler = self.route(path);
-        let path = path_string(path);
+        let handler = self
+            .route(path)
+            .ok_or_else(|| TCError::not_found(path_string(path)))
+            .and_then(|handler| {
+                handler
+                    .put()
+                    .ok_or_else(|| TCError::method_not_allowed(Method::Put, path_string(path)))
+            });
+
         async move {
-            let handler = handler.ok_or_else(|| TCError::not_found(path.clone()))?;
-            let handler = handler
-                .put()
-                .ok_or_else(|| TCError::method_not_allowed(Method::Put, path))?;
+            let handler = handler?;
             handler(txn, key, value).await
         }
     }
@@ -157,13 +165,17 @@ where
         path: &[PathSegment],
         params: Map<State>,
     ) -> impl Future<Output = TCResult<State>> + Send + 'a {
-        let handler = self.route(path);
-        let path = path_string(path);
+        let handler = self
+            .route(path)
+            .ok_or_else(|| TCError::not_found(path_string(path)))
+            .and_then(|handler| {
+                handler
+                    .post()
+                    .ok_or_else(|| TCError::method_not_allowed(Method::Post, path_string(path)))
+            });
+
         async move {
-            let handler = handler.ok_or_else(|| TCError::not_found(path.clone()))?;
-            let handler = handler
-                .post()
-                .ok_or_else(|| TCError::method_not_allowed(Method::Post, path))?;
+            let handler = handler?;
             handler(txn, params).await
         }
     }
@@ -174,13 +186,17 @@ where
         path: &[PathSegment],
         key: Scalar,
     ) -> impl Future<Output = TCResult<()>> + Send + 'a {
-        let handler = self.route(path);
-        let path = path_string(path);
+        let handler = self
+            .route(path)
+            .ok_or_else(|| TCError::not_found(path_string(path)))
+            .and_then(|handler| {
+                handler
+                    .delete()
+                    .ok_or_else(|| TCError::method_not_allowed(Method::Delete, path_string(path)))
+            });
+
         async move {
-            let handler = handler.ok_or_else(|| TCError::not_found(path.clone()))?;
-            let handler = handler
-                .delete()
-                .ok_or_else(|| TCError::method_not_allowed(Method::Delete, path))?;
+            let handler = handler?;
             handler(txn, key).await
         }
     }

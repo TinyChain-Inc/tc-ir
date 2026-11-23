@@ -21,12 +21,12 @@ mod map;
 pub use map::Map;
 
 mod codec;
-pub use codec::{decode_op_def_entry, decode_scalar};
+pub use codec::{decode_scalar, decode_scalar_entry};
 
 /// Maximum decoded structural nesting, shared with enclosing State decoders.
 ///
 /// Typed recursive decoding uses a conservative limit on normal worker stacks;
-/// 32-level normal-stack regressions provide headroom for the public limit of 16.
+/// Normal-stack regressions cover the public limit of 16 and rejection above it.
 /// Boxing alone does not bound recursive polling. Native constructors must respect
 /// this contract; codec checks do not bound program-generated structures.
 pub const MAX_SCALAR_DEPTH: usize = 16;
@@ -43,7 +43,6 @@ pub use tcref::*;
 #[cfg(test)]
 #[path = "../tests/unit/stack_tests.rs"]
 mod stack_tests;
-
 #[cfg(test)]
 #[path = "../tests/unit/tests.rs"]
 mod tests;
